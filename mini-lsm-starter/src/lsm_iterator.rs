@@ -1,12 +1,11 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use anyhow::Result;
-
 use crate::{
     iterators::{merge_iterator::MergeIterator, StorageIterator},
     mem_table::MemTableIterator,
 };
+use anyhow::{bail, Result};
 
 /// Represents the internal type for an LSM iterator. This type will be changed across the tutorial for multiple times.
 type LsmIteratorInner = MergeIterator<MemTableIterator>;
@@ -17,27 +16,39 @@ pub struct LsmIterator {
 
 impl LsmIterator {
     pub(crate) fn new(iter: LsmIteratorInner) -> Result<Self> {
-        Ok(Self { inner: iter })
+        let mut this = Self { inner: iter };
+        this.move_to_non_delete()?;
+        Ok(this)
+    }
+
+    fn move_to_non_delete(&mut self) -> Result<()> {
+        // 忽略已经删除的键值对,最开始的值也可能是被删除的。
+        while self.inner.is_valid() && self.inner.value().is_empty() {
+            self.inner.next()?;
+        }
+        Ok(())
     }
 }
 
 impl StorageIterator for LsmIterator {
     type KeyType<'a> = &'a [u8];
 
-    fn is_valid(&self) -> bool {
-        unimplemented!()
+    fn value(&self) -> &[u8] {
+        self.inner.value()
     }
 
     fn key(&self) -> &[u8] {
-        unimplemented!()
+        self.inner.key().into_inner()
     }
 
-    fn value(&self) -> &[u8] {
-        unimplemented!()
+    fn is_valid(&self) -> bool {
+        self.inner.is_valid()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        self.inner.next()?;
+        self.move_to_non_delete()?;
+        Ok(())
     }
 }
 
@@ -61,19 +72,34 @@ impl<I: StorageIterator> FusedIterator<I> {
 impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
     type KeyType<'a> = I::KeyType<'a> where Self: 'a;
 
-    fn is_valid(&self) -> bool {
-        unimplemented!()
+    fn value(&self) -> &[u8] {
+        if !self.is_valid() {
+            panic!("Access an invalid iterator!");
+        }
+        self.iter.value()
     }
 
     fn key(&self) -> Self::KeyType<'_> {
-        unimplemented!()
+        if !self.is_valid() {
+            panic!("Access an invalid iterator!");
+        }
+        self.iter.key()
     }
 
-    fn value(&self) -> &[u8] {
-        unimplemented!()
+    fn is_valid(&self) -> bool {
+        !self.has_errored && self.iter.is_valid()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if self.has_errored {
+            bail!("The next method has encountered an error!")
+        }
+        match self.iter.next() {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                self.has_errored = true;
+                Err(e)
+            }
+        }
     }
 }

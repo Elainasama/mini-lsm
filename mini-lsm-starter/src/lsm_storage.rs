@@ -15,6 +15,7 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::merge_iterator::MergeIterator;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::MemTable;
@@ -353,14 +354,11 @@ impl LsmStorageInner {
         let new_table = Arc::new(MemTable::create_with_wal(id, self.path_of_wal(id))?);
         {
             let mut state_lock = self.state.write();
-            let mut state_arc = state_lock.clone();
-            // 获取 LsmStorageState 的可变引用
-            let state = Arc::make_mut(&mut state_arc);
+            let mut state = state_lock.as_ref().clone();
 
-            let cur_table = state.memtable.clone();
-            state.imm_memtables.insert(0, cur_table);
-            state.memtable = new_table;
-            *state_lock = state_arc;
+            let old_table = std::mem::replace(&mut state.memtable, new_table);
+            state.imm_memtables.insert(0, old_table);
+            *state_lock = Arc::new(state);
         }
         Ok(())
     }
@@ -381,6 +379,16 @@ impl LsmStorageInner {
         _lower: Bound<&[u8]>,
         _upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        unimplemented!()
+        let r_lock = self.state.read();
+        let mut vec = Vec::new();
+        vec.push(Box::new(r_lock.memtable.scan(_lower, _upper)));
+
+        for memtable in &r_lock.imm_memtables {
+            vec.push(Box::new(memtable.scan(_lower, _upper)));
+        }
+
+        Ok(FusedIterator::new(LsmIterator::new(
+            MergeIterator::create(vec),
+        )?))
     }
 }

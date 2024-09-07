@@ -1,12 +1,8 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
-use std::cmp::{self};
-use std::collections::BinaryHeap;
-
+use crate::key::{Key, KeySlice};
 use anyhow::Result;
-
-use crate::key::KeySlice;
+use std::cmp::{self};
+use std::collections::binary_heap::PeekMut;
+use std::collections::BinaryHeap;
 
 use super::StorageIterator;
 
@@ -45,7 +41,20 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
-        unimplemented!()
+        let mut this = Self {
+            iters: BinaryHeap::new(),
+            current: None,
+        };
+        // 将有效值加入堆中
+        for (idx, iter) in iters.into_iter().enumerate() {
+            if iter.is_valid() {
+                this.iters.push(HeapWrapper(idx, iter));
+            }
+        }
+        // current保留堆顶值
+        this.current = this.iters.pop();
+
+        this
     }
 }
 
@@ -54,19 +63,54 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
 {
     type KeyType<'a> = KeySlice<'a>;
 
-    fn key(&self) -> KeySlice {
-        unimplemented!()
+    fn value(&self) -> &[u8] {
+        if let Some(wrapper) = self.current.as_ref() {
+            wrapper.1.value()
+        } else {
+            &[]
+        }
     }
 
-    fn value(&self) -> &[u8] {
-        unimplemented!()
+    fn key(&self) -> KeySlice {
+        if let Some(wrapper) = self.current.as_ref() {
+            wrapper.1.key()
+        } else {
+            Key::default()
+        }
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        !self.key().is_empty()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if self.current.is_none() {
+            return Ok(());
+        }
+        let cur = self.current.as_mut().unwrap();
+
+        // 去掉重复键
+        while let Some(mut top) = self.iters.peek_mut() {
+            if top.1.key() == cur.1.key() {
+                if let e @ Err(_) = top.1.next() {
+                    PeekMut::pop(top);
+                    return e;
+                }
+                if !top.1.is_valid() {
+                    PeekMut::pop(top);
+                }
+            } else {
+                break;
+            }
+        }
+
+        cur.1.next()?;
+
+        if cur.1.is_valid() {
+            self.iters.push(std::mem::take(&mut self.current).unwrap());
+        }
+
+        self.current = self.iters.pop();
+        Ok(())
     }
 }
