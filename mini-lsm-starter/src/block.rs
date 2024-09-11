@@ -40,7 +40,7 @@ impl Block {
         let mut cur_idx = data.len() - 2;
         // 获取元素总长度
         let num_entry = Self::get_u16(data, cur_idx);
-        dbg!(num_entry);
+
         for _ in 0..num_entry {
             cur_idx -= 2;
             offsets.push(Self::get_u16(data, cur_idx));
