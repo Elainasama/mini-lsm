@@ -1,14 +1,11 @@
 #![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
-
-use anyhow::Result;
-use bytes::Bytes;
-use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use crate::block::Block;
 use crate::compact::{
@@ -16,11 +13,17 @@ use crate::compact::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::iterators::StorageIterator;
+use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::MemTable;
+use crate::mem_table::{map_bound, MemTable};
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableIterator};
+use anyhow::Result;
+use bytes::Bytes;
+use parking_lot::{Mutex, MutexGuard, RwLock};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -280,8 +283,13 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        let r_lock = self.state.read();
-        if let Some(value) = r_lock.memtable.get(_key) {
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
+
+        // memtables
+        if let Some(value) = snapshot.memtable.get(_key) {
             // In the mini-lsm implementation,
             // deletion is represented as a key corresponding to an empty value.
             if value.is_empty() {
@@ -289,7 +297,7 @@ impl LsmStorageInner {
             }
             return Ok(Some(value));
         }
-        for table in &r_lock.imm_memtables {
+        for table in &snapshot.imm_memtables {
             if let Some(value) = table.get(_key) {
                 if value.is_empty() {
                     return Ok(None);
@@ -297,6 +305,23 @@ impl LsmStorageInner {
                 return Ok(Some(value));
             }
         }
+
+        // l0_sst
+        for sst_id in snapshot.l0_sstables.iter() {
+            let table = snapshot.sstables.get(sst_id).unwrap().clone();
+            let key = KeySlice::from_slice(_key);
+            // 快速判断
+            if table.first_key().as_key_slice() <= key && key <= table.last_key().as_key_slice() {
+                let iter = SsTableIterator::create_and_seek_to_key(table, key)?;
+                if iter.is_valid() && iter.key() == key {
+                    if iter.value().is_empty() {
+                        return Ok(None);
+                    }
+                    return Ok(Some(Bytes::copy_from_slice(iter.value())));
+                }
+            }
+        }
+
         Ok(None)
     }
 
@@ -373,22 +398,98 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    fn overlap_range(
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        begin: KeySlice,
+        end: KeySlice,
+    ) -> bool {
+        match lower {
+            Bound::Included(x) => {
+                if end < KeySlice::from_slice(x) {
+                    return false;
+                }
+            }
+            Bound::Excluded(x) => {
+                if end <= KeySlice::from_slice(x) {
+                    return false;
+                }
+            }
+            Bound::Unbounded => {}
+        }
+        match upper {
+            Bound::Included(x) => {
+                if begin > KeySlice::from_slice(x) {
+                    return false;
+                }
+            }
+            Bound::Excluded(x) => {
+                if begin >= KeySlice::from_slice(x) {
+                    return false;
+                }
+            }
+            Bound::Unbounded => {}
+        }
+        true
+    }
+
     /// Create an iterator over a range of keys.
     pub fn scan(
         &self,
         _lower: Bound<&[u8]>,
         _upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        let r_lock = self.state.read();
-        let mut vec = Vec::new();
-        vec.push(Box::new(r_lock.memtable.scan(_lower, _upper)));
+        // todo 这里为什么不上读锁？
+        let snapshot = {
+            let guard = self.state.read();
+            Arc::clone(&guard)
+        };
+        // memtable
+        let mut memtable_iters = Vec::with_capacity(snapshot.imm_memtables.len() + 1);
+        memtable_iters.push(Box::new(snapshot.memtable.scan(_lower, _upper)));
 
-        for memtable in &r_lock.imm_memtables {
-            vec.push(Box::new(memtable.scan(_lower, _upper)));
+        for memtable in &snapshot.imm_memtables {
+            memtable_iters.push(Box::new(memtable.scan(_lower, _upper)));
         }
 
+        // l0-sst
+        let mut l0_sst_iters = Vec::with_capacity(snapshot.l0_sstables.len());
+        for sst_id in snapshot.l0_sstables.iter() {
+            let table = snapshot.sstables.get(sst_id).unwrap().clone();
+            if Self::overlap_range(
+                _lower,
+                _upper,
+                table.first_key().as_key_slice(),
+                table.last_key().as_key_slice(),
+            ) {
+                let iter = match _lower {
+                    Bound::Included(x) => {
+                        SsTableIterator::create_and_seek_to_key(table, KeySlice::from_slice(x))?
+                    }
+                    Bound::Excluded(x) => {
+                        let mut iter = SsTableIterator::create_and_seek_to_key(
+                            table,
+                            KeySlice::from_slice(x),
+                        )?;
+                        if iter.is_valid() && iter.key() == KeySlice::from_slice(x) {
+                            iter.next()?
+                        }
+                        iter
+                    }
+                    Bound::Unbounded => SsTableIterator::create_and_seek_to_first(table)?,
+                };
+
+                l0_sst_iters.push(Box::new(iter));
+            }
+        }
+
+        // 右边界upper通过LsmIterator上层终止,之前的代码并未测试到这里。
         Ok(FusedIterator::new(LsmIterator::new(
-            MergeIterator::create(vec),
+            TwoMergeIterator::create(
+                MergeIterator::create(memtable_iters),
+                MergeIterator::create(l0_sst_iters),
+            )?,
+            map_bound(_upper),
         )?))
     }
 }

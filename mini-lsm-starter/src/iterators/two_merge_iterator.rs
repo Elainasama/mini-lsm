@@ -2,6 +2,7 @@
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
 use anyhow::Result;
+use std::cmp::Ordering;
 
 use super::StorageIterator;
 
@@ -19,7 +20,7 @@ impl<
     > TwoMergeIterator<A, B>
 {
     pub fn create(a: A, b: B) -> Result<Self> {
-        unimplemented!()
+        Ok(Self { a, b })
     }
 }
 
@@ -31,18 +32,51 @@ impl<
     type KeyType<'a> = A::KeyType<'a>;
 
     fn key(&self) -> Self::KeyType<'_> {
-        unimplemented!()
+        if !self.b.is_valid() {
+            return self.a.key();
+        }
+        if !self.a.is_valid() {
+            return self.b.key();
+        }
+        if self.a.key() <= self.b.key() {
+            return self.a.key();
+        }
+        self.b.key()
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        if !self.b.is_valid() {
+            return self.a.value();
+        }
+        if !self.a.is_valid() {
+            return self.b.value();
+        }
+        if self.a.key() <= self.b.key() {
+            return self.a.value();
+        }
+        self.b.value()
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.a.is_valid() || self.b.is_valid()
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if !self.b.is_valid() {
+            return self.a.next();
+        }
+        if !self.a.is_valid() {
+            return self.b.next();
+        }
+
+        let ord = self.a.key().cmp(&self.b.key());
+        match ord {
+            Ordering::Less => self.a.next(),
+            Ordering::Equal => {
+                self.a.next()?;
+                self.b.next()
+            }
+            Ordering::Greater => self.b.next(),
+        }
     }
 }
