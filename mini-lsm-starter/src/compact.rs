@@ -146,6 +146,13 @@ impl LsmStorageInner {
     }
 
     fn trigger_flush(&self) -> Result<()> {
+        let table_num = {
+            let guard = self.state.read();
+            1 + guard.imm_memtables.len()
+        };
+        if table_num > self.options.num_memtable_limit {
+            self.force_flush_next_imm_memtable()?;
+        }
         Ok(())
     }
 

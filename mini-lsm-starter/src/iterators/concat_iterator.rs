@@ -32,11 +32,11 @@ impl SstConcatIterator {
 impl StorageIterator for SstConcatIterator {
     type KeyType<'a> = KeySlice<'a>;
 
-    fn key(&self) -> KeySlice {
+    fn value(&self) -> &[u8] {
         unimplemented!()
     }
 
-    fn value(&self) -> &[u8] {
+    fn key(&self) -> KeySlice {
         unimplemented!()
     }
 

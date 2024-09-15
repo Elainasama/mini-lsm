@@ -31,19 +31,6 @@ impl<
 {
     type KeyType<'a> = A::KeyType<'a>;
 
-    fn key(&self) -> Self::KeyType<'_> {
-        if !self.b.is_valid() {
-            return self.a.key();
-        }
-        if !self.a.is_valid() {
-            return self.b.key();
-        }
-        if self.a.key() <= self.b.key() {
-            return self.a.key();
-        }
-        self.b.key()
-    }
-
     fn value(&self) -> &[u8] {
         if !self.b.is_valid() {
             return self.a.value();
@@ -55,6 +42,19 @@ impl<
             return self.a.value();
         }
         self.b.value()
+    }
+
+    fn key(&self) -> Self::KeyType<'_> {
+        if !self.b.is_valid() {
+            return self.a.key();
+        }
+        if !self.a.is_valid() {
+            return self.b.key();
+        }
+        if self.a.key() <= self.b.key() {
+            return self.a.key();
+        }
+        self.b.key()
     }
 
     fn is_valid(&self) -> bool {
@@ -78,5 +78,9 @@ impl<
             }
             Ordering::Greater => self.b.next(),
         }
+    }
+
+    fn num_active_iterators(&self) -> usize {
+        self.a.num_active_iterators() + self.b.num_active_iterators()
     }
 }

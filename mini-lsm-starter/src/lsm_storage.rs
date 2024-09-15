@@ -1,7 +1,6 @@
 #![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
@@ -20,8 +19,8 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::{map_bound, MemTable};
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableIterator};
-use anyhow::Result;
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
+use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 
@@ -158,7 +157,29 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        self.compaction_notifier.send(()).ok();
+        self.flush_notifier.send(()).ok();
+
+        let mut compaction_thread = self.compaction_thread.lock();
+        let mut flush_thread = self.flush_thread.lock();
+        if let Some(compaction_thread) = compaction_thread.take() {
+            compaction_thread.join().map_err(|e| anyhow!("{:?}", e))?
+        }
+        if let Some(flush_thread) = flush_thread.take() {
+            flush_thread.join().map_err(|e| anyhow!("{:?}", e))?
+        }
+
+        // 将剩余的memtable存盘
+        if !self.inner.state.read().memtable.is_empty() {
+            self.inner
+                .force_freeze_memtable(&self.inner.state_lock.lock())?;
+        }
+
+        while !self.inner.state.read().imm_memtables.is_empty() {
+            self.inner.force_flush_next_imm_memtable()?;
+        }
+
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -332,7 +353,7 @@ impl LsmStorageInner {
 
     pub fn check_over_capacity(&self, _key: &[u8], _value: &[u8]) -> bool {
         let size = self.state.read().memtable.approximate_size();
-        size + _key.len() + _value.len() > self.options.num_memtable_limit
+        size + _key.len() + _value.len() > self.options.target_sst_size
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
@@ -344,7 +365,8 @@ impl LsmStorageInner {
                 self.force_freeze_memtable(&state_lock)?;
             }
         }
-        self.state.write().memtable.put(_key, _value)
+        // 可以支持不可变引用更新
+        self.state.read().memtable.put(_key, _value)
     }
 
     /// Remove a key from the storage by writing an empty value.
@@ -390,7 +412,33 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        let _state_lock = self.state_lock.lock();
+        let flush_table = self
+            .state
+            .read()
+            .imm_memtables
+            .last()
+            .expect("No imm_memtable!")
+            .clone();
+        let mut sst_builder = SsTableBuilder::new(self.options.block_size);
+        let sst_id = flush_table.id();
+        flush_table.flush(&mut sst_builder)?;
+        let sst_table = sst_builder.build(
+            sst_id,
+            Some(self.block_cache.clone()),
+            self.path_of_sst(sst_id),
+        )?;
+
+        // flush SST表，并且删除flush_table
+        {
+            let mut guard = self.state.write();
+            let mut state = guard.as_ref().clone();
+            state.imm_memtables.pop();
+            state.l0_sstables.insert(0, sst_id);
+            state.sstables.insert(sst_id, Arc::new(sst_table));
+            *guard = Arc::new(state);
+        }
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
@@ -439,7 +487,7 @@ impl LsmStorageInner {
         _lower: Bound<&[u8]>,
         _upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        // todo 这里为什么不上读锁？
+        // 这里不上读锁，自身数据结构不可变的Arc可以实现并发的读写。
         let snapshot = {
             let guard = self.state.read();
             Arc::clone(&guard)
