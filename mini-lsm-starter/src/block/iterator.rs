@@ -1,10 +1,10 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use crate::key::{Key, KeySlice, KeyVec};
-use std::sync::Arc;
-
 use super::Block;
+use crate::key::{Key, KeySlice, KeyVec};
+use bytes::Buf;
+use std::sync::Arc;
 
 /// Iterates on a block.
 pub struct BlockIterator {
@@ -20,6 +20,7 @@ pub struct BlockIterator {
     first_key: KeyVec,
 }
 
+const SIZE_U16: usize = std::mem::size_of::<u16>();
 impl BlockIterator {
     fn new(block: Arc<Block>) -> Self {
         Self {
@@ -71,16 +72,23 @@ impl BlockIterator {
     }
 
     fn update_key_value(&mut self, offset: u16) {
-        let mut offset = offset;
-        let key_len = Block::get_u16(&self.block.data, offset as usize);
-        offset += 2;
-        self.key = Key::from_vec(
-            self.block.data[(offset as usize)..((offset + key_len) as usize)].to_vec(),
-        );
-        offset += key_len;
-        let val_len = Block::get_u16(&self.block.data, offset as usize);
-        offset += 2;
-        self.value_range = (offset as usize, (offset + val_len) as usize);
+        let mut offset = offset as usize;
+        // let key_len = (&self.block.data[offset..offset + SIZE_U16]).get_u16();
+        // offset += 2;
+        // self.key = Key::from_vec(self.block.data[(offset)..(offset + key_len as usize)].to_vec());
+
+        // key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len)
+        let key_overlap_len = (&self.block.data[offset..offset + SIZE_U16]).get_u16();
+        offset += SIZE_U16;
+        let key_rest_len = (&self.block.data[offset..offset + SIZE_U16]).get_u16();
+        offset += SIZE_U16;
+        let mut key = self.first_key.raw_ref()[..key_overlap_len as usize].to_vec();
+        key.extend(self.block.data[offset..offset + key_rest_len as usize].to_vec());
+        self.key = Key::from_vec(key);
+        offset += key_rest_len as usize;
+        let val_len = (&self.block.data[offset..offset + SIZE_U16]).get_u16();
+        offset += SIZE_U16;
+        self.value_range = (offset, offset + val_len as usize);
     }
 
     /// Move to the next key in the block.

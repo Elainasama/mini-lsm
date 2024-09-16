@@ -330,6 +330,12 @@ impl LsmStorageInner {
         // l0_sst
         for sst_id in snapshot.l0_sstables.iter() {
             let table = snapshot.sstables.get(sst_id).unwrap().clone();
+            if let Some(bloom) = &table.bloom {
+                // 键不存在该sst中
+                if !bloom.may_contain(farmhash::fingerprint32(_key)) {
+                    continue;
+                }
+            }
             let key = KeySlice::from_slice(_key);
             // 快速判断
             if table.first_key().as_key_slice() <= key && key <= table.last_key().as_key_slice() {
