@@ -350,35 +350,37 @@ impl LsmStorageInner {
             }
         }
 
-        // l1_sst 之间严格有序 考虑二分
-        let mut left = 0;
-        let mut right = snapshot.levels[0].1.len();
-        while left < right {
-            let mid = (left + right) / 2;
-            let sst_id = &snapshot.levels[0].1[mid];
-            let table = snapshot.sstables.get(sst_id).unwrap().clone();
-            if table.first_key().as_key_slice() <= KeySlice::from_slice(_key) {
-                left = mid + 1;
-            } else {
-                right = mid;
-            }
-        }
-        if left > 0 {
-            let target_idx = left - 1;
-            let sst_id = &snapshot.levels[0].1[target_idx];
-            let table = snapshot.sstables.get(sst_id).unwrap().clone();
-            if let Some(bloom) = &table.bloom {
-                // 键不存在该sst中
-                if !bloom.may_contain(farmhash::fingerprint32(_key)) {
-                    return Ok(None);
+        // l1_sst之后的sst之间严格有序 考虑二分
+        for level in 0..snapshot.levels.len() {
+            let mut left = 0;
+            let mut right = snapshot.levels[level].1.len();
+            while left < right {
+                let mid = (left + right) / 2;
+                let sst_id = &snapshot.levels[level].1[mid];
+                let table = snapshot.sstables.get(sst_id).unwrap().clone();
+                if table.first_key().as_key_slice() <= KeySlice::from_slice(_key) {
+                    left = mid + 1;
+                } else {
+                    right = mid;
                 }
             }
-            let key = KeySlice::from_slice(_key);
-            let iter = SsTableIterator::create_and_seek_to_key(table, key)?;
-            if iter.is_valid() && iter.key() == key {
-                // 压缩后不应该存在删除墓碑
-                assert!(!iter.value().is_empty());
-                return Ok(Some(Bytes::copy_from_slice(iter.value())));
+            if left > 0 {
+                let target_idx = left - 1;
+                let sst_id = &snapshot.levels[level].1[target_idx];
+                let table = snapshot.sstables.get(sst_id).unwrap().clone();
+                if let Some(bloom) = &table.bloom {
+                    // 键不存在该sst中
+                    if !bloom.may_contain(farmhash::fingerprint32(_key)) {
+                        return Ok(None);
+                    }
+                }
+                let key = KeySlice::from_slice(_key);
+                let iter = SsTableIterator::create_and_seek_to_key(table, key)?;
+                if iter.is_valid() && iter.key() == key {
+                    // 压缩后不应该存在删除墓碑
+                    assert!(!iter.value().is_empty());
+                    return Ok(Some(Bytes::copy_from_slice(iter.value())));
+                }
             }
         }
 
@@ -570,20 +572,26 @@ impl LsmStorageInner {
             }
         }
 
-        // l1-sst
-        let mut l1_sst = Vec::new();
-        for id in &snapshot.levels[0].1 {
-            l1_sst.push(snapshot.sstables.get(id).unwrap().clone());
+        // level-sst
+        let mut level_iters = Vec::with_capacity(snapshot.levels.len());
+        for level in 0..snapshot.levels.len() {
+            let mut level_sst = Vec::with_capacity(snapshot.levels[level].1.len());
+            for id in &snapshot.levels[level].1 {
+                level_sst.push(snapshot.sstables.get(id).unwrap().clone());
+            }
+
+            level_iters.push(Box::new(SstConcatIterator::create_and_seek_to_first(
+                level_sst,
+            )?));
         }
         let two_merge_iter = TwoMergeIterator::create(
             MergeIterator::create(memtable_iters),
             MergeIterator::create(l0_sst_iters),
         )?;
-        let concat_iter = SstConcatIterator::create_and_seek_to_first(l1_sst)?;
 
         // 右边界upper通过LsmIterator上层终止,之前的代码并未测试到这里。
         Ok(FusedIterator::new(LsmIterator::new(
-            TwoMergeIterator::create(two_merge_iter, concat_iter)?,
+            TwoMergeIterator::create(two_merge_iter, MergeIterator::create(level_iters))?,
             map_bound(_upper),
         )?))
     }

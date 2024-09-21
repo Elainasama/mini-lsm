@@ -109,6 +109,46 @@ pub enum CompactionOptions {
 }
 
 impl LsmStorageInner {
+    fn create_new_sst(&self, sst: Vec<Arc<SsTable>>) -> Result<Vec<Arc<SsTable>>> {
+        let mut sst_iters = Vec::with_capacity(sst.len());
+        for table in sst {
+            sst_iters.push(Box::new(SsTableIterator::create_and_seek_to_first(table)?))
+        }
+        let mut iter = MergeIterator::create(sst_iters);
+        let mut new_sst = Vec::new();
+        let mut builder = SsTableBuilder::new(self.options.block_size);
+        while iter.is_valid() {
+            // 删除delete墓碑
+            if !iter.value().is_empty() {
+                let key = iter.key();
+                let value = iter.value();
+                builder.add(key, value);
+                if builder.estimated_size() > self.options.target_sst_size {
+                    let old_builder = std::mem::replace(
+                        &mut builder,
+                        SsTableBuilder::new(self.options.block_size),
+                    );
+                    let id = self.next_sst_id();
+                    new_sst.push(Arc::new(old_builder.build(
+                        id,
+                        Some(self.block_cache.clone()),
+                        self.path_of_sst(id),
+                    )?));
+                }
+            }
+            iter.next()?
+        }
+        // 最后一块sst
+        if !builder.is_empty() {
+            let id = self.next_sst_id();
+            new_sst.push(Arc::new(builder.build(
+                id,
+                Some(self.block_cache.clone()),
+                self.path_of_sst(id),
+            )?));
+        }
+        Ok(new_sst)
+    }
     fn compact(&self, _task: &CompactionTask) -> Result<Vec<Arc<SsTable>>> {
         match _task {
             CompactionTask::ForceFullCompaction {
@@ -125,46 +165,29 @@ impl LsmStorageInner {
                         sst.push(read_lock.sstables.get(sst_id).unwrap().clone());
                     }
                 }
-                let mut sst_iters = Vec::with_capacity(sst.len());
-                for table in sst {
-                    sst_iters.push(Box::new(SsTableIterator::create_and_seek_to_first(table)?))
-                }
 
-                let mut iter = MergeIterator::create(sst_iters);
-                let mut new_sst = Vec::new();
-                let mut builder = SsTableBuilder::new(self.options.block_size);
-                while iter.is_valid() {
-                    // 删除delete墓碑
-                    if !iter.value().is_empty() {
-                        let key = iter.key();
-                        let value = iter.value();
-                        builder.add(key, value);
-                        if builder.estimated_size() > self.options.target_sst_size {
-                            let old_builder = std::mem::replace(
-                                &mut builder,
-                                SsTableBuilder::new(self.options.block_size),
-                            );
-                            let id = self.next_sst_id();
-                            new_sst.push(Arc::new(old_builder.build(
-                                id,
-                                Some(self.block_cache.clone()),
-                                self.path_of_sst(id),
-                            )?));
-                        }
+                self.create_new_sst(sst)
+            }
+            CompactionTask::Simple(task) => {
+                let mut sst = Vec::with_capacity(
+                    task.lower_level_sst_ids.len() + task.upper_level_sst_ids.len(),
+                );
+                {
+                    let read_lock = self.state.read();
+                    for sst_id in &task.upper_level_sst_ids {
+                        sst.push(read_lock.sstables.get(sst_id).unwrap().clone());
                     }
-                    iter.next()?
+                    for sst_id in &task.lower_level_sst_ids {
+                        sst.push(read_lock.sstables.get(sst_id).unwrap().clone());
+                    }
                 }
-                // 最后一块sst
-                if !builder.is_empty() {
-                    let id = self.next_sst_id();
-                    new_sst.push(Arc::new(builder.build(
-                        id,
-                        Some(self.block_cache.clone()),
-                        self.path_of_sst(id),
-                    )?));
-                }
-
-                Ok(new_sst)
+                println!(
+                    "Compact completed level {},up_sst_len {} low_sst_len {}",
+                    task.lower_level,
+                    task.upper_level_sst_ids.len(),
+                    task.lower_level_sst_ids.len()
+                );
+                self.create_new_sst(sst)
             }
             _ => Ok(Vec::new()),
         }
@@ -184,19 +207,19 @@ impl LsmStorageInner {
             let _state_lock = self.state_lock.lock();
             let mut state = self.state.read().as_ref().clone();
 
-            state
-                .l0_sstables
-                .retain(|&x| !ssts_to_compact.0.contains(&x));
             for id in ssts_to_compact.0.iter() {
                 state.sstables.remove(id);
             }
-
-            state.levels[0]
-                .1
-                .retain(|&x| !ssts_to_compact.1.contains(&x));
             for id in ssts_to_compact.1.iter() {
                 state.sstables.remove(id);
             }
+
+            state
+                .l0_sstables
+                .retain(|&x| state.sstables.contains_key(&x));
+            state.levels[0]
+                .1
+                .retain(|&x| state.sstables.contains_key(&x));
 
             for sst in &new_sst {
                 state.levels[0].1.push(sst.sst_id());
@@ -215,7 +238,44 @@ impl LsmStorageInner {
     }
 
     fn trigger_compaction(&self) -> Result<()> {
-        unimplemented!()
+        let snapshot = self.state.read().as_ref().clone();
+        if let Some(compaction_task) = self
+            .compaction_controller
+            .generate_compaction_task(&snapshot)
+        {
+            let new_sst = self.compact(&compaction_task)?;
+            let to_remove = {
+                let _state_lock = self.state_lock.lock();
+                let mut state = self.state.write();
+                let mut output = Vec::with_capacity(new_sst.len());
+                for table in new_sst.iter() {
+                    output.push(table.sst_id());
+                }
+                // 这里一定要读取最新的状态
+                let snapshot = state.as_ref().clone();
+                let (mut new_state, to_remove) = self
+                    .compaction_controller
+                    .apply_compaction_result(&snapshot, &compaction_task, &output[..], false);
+                for sst_id in &to_remove {
+                    new_state.sstables.remove(sst_id);
+                }
+                for table in &new_sst {
+                    new_state.sstables.insert(table.sst_id(), table.clone());
+                }
+                *state = Arc::new(new_state);
+                println!(
+                    "Compact completed,{} files remove,{} files add,output {:?}",
+                    to_remove.len(),
+                    output.len(),
+                    output
+                );
+                to_remove
+            };
+            for sst_id in to_remove.iter() {
+                std::fs::remove_file(self.path_of_sst(*sst_id))?;
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn spawn_compaction_thread(
