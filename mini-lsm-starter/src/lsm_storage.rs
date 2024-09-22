@@ -475,7 +475,13 @@ impl LsmStorageInner {
             let mut guard = self.state.write();
             let mut state = guard.as_ref().clone();
             state.imm_memtables.pop();
-            state.l0_sstables.insert(0, sst_id);
+            // Tiered Compaction 不需要 l0层
+            if self.compaction_controller.flush_to_l0() {
+                state.l0_sstables.insert(0, sst_id);
+            } else {
+                state.levels.insert(0, (sst_id, vec![sst_id]))
+            }
+
             state.sstables.insert(sst_id, Arc::new(sst_table));
             *guard = Arc::new(state);
         }

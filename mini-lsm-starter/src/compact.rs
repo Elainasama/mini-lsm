@@ -189,6 +189,18 @@ impl LsmStorageInner {
                 );
                 self.create_new_sst(sst)
             }
+            CompactionTask::Tiered(task) => {
+                let mut sst = Vec::new();
+                {
+                    let read_lock = self.state.read();
+                    for level in task.tiers.iter() {
+                        for sst_id in level.1.iter() {
+                            sst.push(read_lock.sstables.get(sst_id).unwrap().clone());
+                        }
+                    }
+                }
+                self.create_new_sst(sst)
+            }
             _ => Ok(Vec::new()),
         }
     }
@@ -262,13 +274,19 @@ impl LsmStorageInner {
                 for table in &new_sst {
                     new_state.sstables.insert(table.sst_id(), table.clone());
                 }
+                {
+                    // debug
+                    println!(
+                        "Compact completed,{} files remove,{} files add,output {:?}",
+                        to_remove.len(),
+                        output.len(),
+                        output
+                    );
+                    for level in new_state.levels.iter() {
+                        println!("level {} sst {:?}", level.0, level.1);
+                    }
+                }
                 *state = Arc::new(new_state);
-                println!(
-                    "Compact completed,{} files remove,{} files add,output {:?}",
-                    to_remove.len(),
-                    output.len(),
-                    output
-                );
                 to_remove
             };
             for sst_id in to_remove.iter() {
