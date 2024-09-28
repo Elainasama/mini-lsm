@@ -349,7 +349,23 @@ impl LsmStorageInner {
                 }
             }
         }
-
+        {
+            // debug
+            // 严格有序性
+            for level in 0..snapshot.levels.len() {
+                for idx in 1..snapshot.levels[level].1.len() {
+                    let front = snapshot
+                        .sstables
+                        .get(&snapshot.levels[level].1[idx - 1])
+                        .unwrap();
+                    let cur = snapshot
+                        .sstables
+                        .get(&snapshot.levels[level].1[idx - 1])
+                        .unwrap();
+                    assert!(front.first_key() <= cur.first_key())
+                }
+            }
+        }
         // l1_sst之后的sst之间严格有序 考虑二分
         for level in 0..snapshot.levels.len() {
             let mut left = 0;

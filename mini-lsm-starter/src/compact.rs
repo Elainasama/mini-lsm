@@ -201,7 +201,21 @@ impl LsmStorageInner {
                 }
                 self.create_new_sst(sst)
             }
-            _ => Ok(Vec::new()),
+            CompactionTask::Leveled(task) => {
+                let mut sst = Vec::with_capacity(
+                    task.lower_level_sst_ids.len() + task.upper_level_sst_ids.len(),
+                );
+                {
+                    let read_lock = self.state.read();
+                    for sst_id in &task.upper_level_sst_ids {
+                        sst.push(read_lock.sstables.get(sst_id).unwrap().clone());
+                    }
+                    for sst_id in &task.lower_level_sst_ids {
+                        sst.push(read_lock.sstables.get(sst_id).unwrap().clone());
+                    }
+                }
+                self.create_new_sst(sst)
+            }
         }
     }
 
@@ -260,19 +274,19 @@ impl LsmStorageInner {
                 let _state_lock = self.state_lock.lock();
                 let mut state = self.state.write();
                 let mut output = Vec::with_capacity(new_sst.len());
+                // 这里一定要读取最新的状态
+                let mut snapshot = state.as_ref().clone();
                 for table in new_sst.iter() {
                     output.push(table.sst_id());
+                    // For level Compaction 前置
+                    snapshot.sstables.insert(table.sst_id(), table.clone());
                 }
-                // 这里一定要读取最新的状态
-                let snapshot = state.as_ref().clone();
+
                 let (mut new_state, to_remove) = self
                     .compaction_controller
                     .apply_compaction_result(&snapshot, &compaction_task, &output[..], false);
                 for sst_id in &to_remove {
                     new_state.sstables.remove(sst_id);
-                }
-                for table in &new_sst {
-                    new_state.sstables.insert(table.sst_id(), table.clone());
                 }
                 {
                     // debug
