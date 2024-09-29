@@ -1,6 +1,9 @@
 #![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
+use std::cmp::max;
 use std::collections::HashMap;
+use std::fs;
+use std::fs::File;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicUsize;
@@ -17,10 +20,10 @@ use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
 use crate::key::KeySlice;
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
-use crate::manifest::Manifest;
+use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{map_bound, MemTable};
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
+use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
@@ -158,6 +161,7 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
+        self.inner.sync_dir()?;
         self.compaction_notifier.send(()).ok();
         self.flush_notifier.send(()).ok();
 
@@ -171,13 +175,15 @@ impl MiniLsm {
         }
 
         // 将剩余的memtable存盘
-        if !self.inner.state.read().memtable.is_empty() {
-            self.inner
-                .force_freeze_memtable(&self.inner.state_lock.lock())?;
-        }
+        if !self.inner.options.enable_wal {
+            if !self.inner.state.read().memtable.is_empty() {
+                self.inner
+                    .force_freeze_memtable(&self.inner.state_lock.lock())?;
+            }
 
-        while !self.inner.state.read().imm_memtables.is_empty() {
-            self.inner.force_flush_next_imm_memtable()?;
+            while !self.inner.state.read().imm_memtables.is_empty() {
+                self.inner.force_flush_next_imm_memtable()?;
+            }
         }
 
         Ok(())
@@ -263,8 +269,9 @@ impl LsmStorageInner {
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
         let path = path.as_ref();
-        let state = LsmStorageState::create(&options);
-
+        let manifest_path = path.join(Path::new("MANIFEST"));
+        let mut state = LsmStorageState::create(&options);
+        let block_cache = Arc::new(BlockCache::new(1024));
         let compaction_controller = match &options.compaction_options {
             CompactionOptions::Leveled(options) => {
                 CompactionController::Leveled(LeveledCompactionController::new(options.clone()))
@@ -278,14 +285,93 @@ impl LsmStorageInner {
             CompactionOptions::NoCompaction => CompactionController::NoCompaction,
         };
 
+        let (next_sst_id, manifest) = {
+            if !path.exists() {
+                fs::create_dir(path)?;
+                File::create(manifest_path.as_path())?;
+                (AtomicUsize::new(1), Some(Manifest::create(manifest_path)?))
+            } else if !manifest_path.exists() {
+                File::create(manifest_path.as_path())?;
+                (AtomicUsize::new(1), Some(Manifest::create(manifest_path)?))
+            } else {
+                // recovery
+                let mut max_sst_id = 0;
+                let (manifest, records) = Manifest::recover(manifest_path.as_path())?;
+                for record in records {
+                    match record {
+                        ManifestRecord::Flush(sst_id) => {
+                            max_sst_id = max(max_sst_id, sst_id);
+                            if compaction_controller.flush_to_l0() {
+                                state.l0_sstables.insert(0, sst_id);
+                            } else {
+                                state.levels.insert(0, (sst_id, vec![sst_id]))
+                            }
+                        }
+                        ManifestRecord::NewMemtable(_) => {}
+                        ManifestRecord::Compaction(task, output) => {
+                            let (new_state, _) = compaction_controller.apply_compaction_result(
+                                &state,
+                                &task,
+                                &output[..],
+                                true,
+                            );
+                            state = new_state;
+                        }
+                    }
+                }
+                {
+                    // debug
+                    println!("Recovery!");
+                    println!("level 0 {:?}", state.l0_sstables.clone());
+                    for level in state.levels.iter() {
+                        println!("level {} sst {:?}", level.0, level.1);
+                    }
+                }
+                // 将存在的sst表加入sst_table中
+                for l0_id in state.l0_sstables.clone() {
+                    let file = FileObject::open(&Self::path_of_sst_static(path, l0_id))?;
+                    state.sstables.insert(
+                        l0_id,
+                        Arc::new(SsTable::open(l0_id, Some(block_cache.clone()), file)?),
+                    );
+                }
+                for level in &state.levels {
+                    for sst_id in level.1.clone() {
+                        let file = FileObject::open(&Self::path_of_sst_static(path, sst_id))?;
+                        state.sstables.insert(
+                            sst_id,
+                            Arc::new(SsTable::open(sst_id, Some(block_cache.clone()), file)?),
+                        );
+                    }
+                }
+                // todo 维护manifest的metadata减少这一步
+                // level之间按first key进行排序
+                if let CompactionOptions::Leveled(_) = &options.compaction_options {
+                    for level in &mut state.levels {
+                        level.1.sort_by(|a, b| {
+                            state
+                                .sstables
+                                .get(a)
+                                .unwrap()
+                                .first_key()
+                                .cmp(state.sstables.get(b).unwrap().first_key())
+                        })
+                    }
+                }
+
+                // set next_sst_id
+                (AtomicUsize::new(max_sst_id + 1), Some(manifest))
+            }
+        };
+
         let storage = Self {
             state: Arc::new(RwLock::new(Arc::new(state))),
             state_lock: Mutex::new(()),
             path: path.to_path_buf(),
-            block_cache: Arc::new(BlockCache::new(1024)),
-            next_sst_id: AtomicUsize::new(1),
+            block_cache,
+            next_sst_id,
             compaction_controller,
-            manifest: None,
+            manifest,
             options: options.into(),
             mvcc: None,
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
@@ -360,9 +446,9 @@ impl LsmStorageInner {
                         .unwrap();
                     let cur = snapshot
                         .sstables
-                        .get(&snapshot.levels[level].1[idx - 1])
+                        .get(&snapshot.levels[level].1[idx])
                         .unwrap();
-                    assert!(front.first_key() <= cur.first_key())
+                    assert!(front.last_key() <= cur.first_key())
                 }
             }
         }
@@ -387,14 +473,16 @@ impl LsmStorageInner {
                 if let Some(bloom) = &table.bloom {
                     // 键不存在该sst中
                     if !bloom.may_contain(farmhash::fingerprint32(_key)) {
-                        return Ok(None);
+                        continue;
                     }
                 }
                 let key = KeySlice::from_slice(_key);
                 let iter = SsTableIterator::create_and_seek_to_key(table, key)?;
                 if iter.is_valid() && iter.key() == key {
-                    // 压缩后不应该存在删除墓碑
-                    assert!(!iter.value().is_empty());
+                    // 订正，删除墓碑只有在level的最后一层可以去掉。
+                    if iter.value().is_empty() {
+                        return Ok(None);
+                    }
                     return Ok(Some(Bytes::copy_from_slice(iter.value())));
                 }
             }
@@ -448,7 +536,8 @@ impl LsmStorageInner {
     }
 
     pub(super) fn sync_dir(&self) -> Result<()> {
-        unimplemented!()
+        File::open(self.path.as_path())?.sync_all()?;
+        Ok(())
     }
 
     /// Force freeze the current memtable to an immutable memtable
@@ -500,6 +589,11 @@ impl LsmStorageInner {
 
             state.sstables.insert(sst_id, Arc::new(sst_table));
             *guard = Arc::new(state);
+        }
+        self.sync_dir()?;
+        // manifest
+        if let Some(manifest) = &self.manifest {
+            manifest.add_record(&_state_lock, ManifestRecord::Flush(sst_id))?
         }
         Ok(())
     }

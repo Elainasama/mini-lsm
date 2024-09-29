@@ -191,14 +191,23 @@ impl LeveledCompactionController {
             snapshot.levels[_task.lower_level - 1].1.len() + _output.len() - hash_set.len(),
         );
         // 判断插入的位置
-        let first_key = snapshot.sstables.get(&_output[0]).unwrap().first_key();
+        let first_key = {
+            if !_in_recovery {
+                Some(snapshot.sstables.get(&_output[0]).unwrap().first_key())
+            } else {
+                None
+            }
+        };
         let mut is_extend = false;
         for sst_id in snapshot.levels[_task.lower_level - 1].1.iter() {
+            // 只有不在重启恢复中才可以进行first key比较
             if !is_extend {
-                let table = snapshot.sstables.get(sst_id).unwrap();
-                if first_key <= table.first_key() {
-                    new_sst_ids.extend(_output);
-                    is_extend = true;
+                if let Some(key) = first_key {
+                    let table = snapshot.sstables.get(sst_id).unwrap();
+                    if key <= table.first_key() {
+                        new_sst_ids.extend(_output);
+                        is_extend = true;
+                    }
                 }
             }
             if !hash_set.contains(sst_id) {

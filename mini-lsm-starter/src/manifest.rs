@@ -1,6 +1,7 @@
 #![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
 use std::fs::File;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -23,11 +24,26 @@ pub enum ManifestRecord {
 
 impl Manifest {
     pub fn create(_path: impl AsRef<Path>) -> Result<Self> {
-        unimplemented!()
+        Ok(Self {
+            file: Arc::new(Mutex::new(File::create(_path)?)),
+        })
     }
 
     pub fn recover(_path: impl AsRef<Path>) -> Result<(Self, Vec<ManifestRecord>)> {
-        unimplemented!()
+        let mut data = Vec::new();
+        let mut file = File::open(_path)?;
+        file.read_to_end(&mut data)?;
+        let mut records = Vec::new();
+        for stream in serde_json::Deserializer::from_slice(&data[..]).into_iter::<ManifestRecord>()
+        {
+            records.push(stream?);
+        }
+        Ok((
+            Self {
+                file: Arc::new(Mutex::new(file)),
+            },
+            records,
+        ))
     }
 
     pub fn add_record(
@@ -39,6 +55,9 @@ impl Manifest {
     }
 
     pub fn add_record_when_init(&self, _record: ManifestRecord) -> Result<()> {
-        unimplemented!()
+        let json = serde_json::to_vec(&_record)?;
+        self.file.lock().write_all(&json)?;
+        self.file.lock().sync_all()?;
+        Ok(())
     }
 }

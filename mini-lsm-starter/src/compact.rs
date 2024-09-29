@@ -10,6 +10,7 @@ use std::time::Duration;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::StorageIterator;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
+use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 use anyhow::Result;
 pub use leveled::{LeveledCompactionController, LeveledCompactionOptions, LeveledCompactionTask};
@@ -109,7 +110,7 @@ pub enum CompactionOptions {
 }
 
 impl LsmStorageInner {
-    fn create_new_sst(&self, sst: Vec<Arc<SsTable>>) -> Result<Vec<Arc<SsTable>>> {
+    fn create_new_sst(&self, sst: Vec<Arc<SsTable>>, is_bottom: bool) -> Result<Vec<Arc<SsTable>>> {
         let mut sst_iters = Vec::with_capacity(sst.len());
         for table in sst {
             sst_iters.push(Box::new(SsTableIterator::create_and_seek_to_first(table)?))
@@ -118,8 +119,8 @@ impl LsmStorageInner {
         let mut new_sst = Vec::new();
         let mut builder = SsTableBuilder::new(self.options.block_size);
         while iter.is_valid() {
-            // 删除delete墓碑
-            if !iter.value().is_empty() {
+            // 只有最后一层可以删除delete墓碑。
+            if !is_bottom || !iter.value().is_empty() {
                 let key = iter.key();
                 let value = iter.value();
                 builder.add(key, value);
@@ -166,7 +167,7 @@ impl LsmStorageInner {
                     }
                 }
 
-                self.create_new_sst(sst)
+                self.create_new_sst(sst, true)
             }
             CompactionTask::Simple(task) => {
                 let mut sst = Vec::with_capacity(
@@ -187,7 +188,7 @@ impl LsmStorageInner {
                     task.upper_level_sst_ids.len(),
                     task.lower_level_sst_ids.len()
                 );
-                self.create_new_sst(sst)
+                self.create_new_sst(sst, task.is_lower_level_bottom_level)
             }
             CompactionTask::Tiered(task) => {
                 let mut sst = Vec::new();
@@ -199,7 +200,7 @@ impl LsmStorageInner {
                         }
                     }
                 }
-                self.create_new_sst(sst)
+                self.create_new_sst(sst, task.bottom_tier_included)
             }
             CompactionTask::Leveled(task) => {
                 let mut sst = Vec::with_capacity(
@@ -214,7 +215,7 @@ impl LsmStorageInner {
                         sst.push(read_lock.sstables.get(sst_id).unwrap().clone());
                     }
                 }
-                self.create_new_sst(sst)
+                self.create_new_sst(sst, task.is_lower_level_bottom_level)
             }
         }
     }
@@ -232,12 +233,15 @@ impl LsmStorageInner {
         {
             let _state_lock = self.state_lock.lock();
             let mut state = self.state.read().as_ref().clone();
-
+            let mut to_remove =
+                Vec::with_capacity(ssts_to_compact.0.len() + ssts_to_compact.1.len());
             for id in ssts_to_compact.0.iter() {
                 state.sstables.remove(id);
+                to_remove.push(*id);
             }
             for id in ssts_to_compact.1.iter() {
                 state.sstables.remove(id);
+                to_remove.push(*id);
             }
 
             state
@@ -246,12 +250,18 @@ impl LsmStorageInner {
             state.levels[0]
                 .1
                 .retain(|&x| state.sstables.contains_key(&x));
-
+            let mut new_sst_id = Vec::with_capacity(new_sst.len());
             for sst in &new_sst {
                 state.levels[0].1.push(sst.sst_id());
+                new_sst_id.push(sst.sst_id());
                 state.sstables.insert(sst.sst_id(), sst.clone());
             }
             *self.state.write() = Arc::new(state);
+            self.sync_dir()?;
+            // manifest
+            if let Some(manifest) = &self.manifest {
+                manifest.add_record(&_state_lock, ManifestRecord::Compaction(task, new_sst_id))?
+            }
         }
         // 删除压缩前文件
         for sst_id in &ssts_to_compact.0 {
@@ -260,6 +270,7 @@ impl LsmStorageInner {
         for sst_id in &ssts_to_compact.1 {
             std::fs::remove_file(self.path_of_sst(*sst_id))?
         }
+        self.sync_dir()?;
         Ok(())
     }
 
@@ -301,11 +312,20 @@ impl LsmStorageInner {
                     }
                 }
                 *state = Arc::new(new_state);
+                self.sync_dir()?;
+                // manifest
+                if let Some(manifest) = &self.manifest {
+                    manifest.add_record(
+                        &_state_lock,
+                        ManifestRecord::Compaction(compaction_task, output),
+                    )?
+                }
                 to_remove
             };
             for sst_id in to_remove.iter() {
                 std::fs::remove_file(self.path_of_sst(*sst_id))?;
             }
+            self.sync_dir()?;
         }
         Ok(())
     }
