@@ -50,7 +50,7 @@ impl MemTable {
     pub fn create_with_wal(_id: usize, _path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
             map: Arc::new(SkipMap::new()),
-            wal: None,
+            wal: Some(Wal::create(_path)?),
             id: _id,
             approximate_size: Arc::new(AtomicUsize::new(0)),
         })
@@ -58,7 +58,14 @@ impl MemTable {
 
     /// Create a memtable from WAL
     pub fn recover_from_wal(_id: usize, _path: impl AsRef<Path>) -> Result<Self> {
-        unimplemented!()
+        let map = Arc::new(SkipMap::new());
+        let wal = Wal::recover(_path.as_ref(), &map)?;
+        Ok(Self {
+            map,
+            wal: Some(wal),
+            id: _id,
+            approximate_size: Arc::new(AtomicUsize::new(0)),
+        })
     }
 
     pub fn for_testing_put_slice(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -95,6 +102,10 @@ impl MemTable {
             _key.len() + _value.len(),
             std::sync::atomic::Ordering::SeqCst,
         );
+        if let Some(wal) = &self.wal {
+            wal.put(_key, _value)?;
+            wal.sync()?;
+        }
         Ok(())
     }
 

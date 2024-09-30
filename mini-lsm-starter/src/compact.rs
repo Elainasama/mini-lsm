@@ -307,6 +307,12 @@ impl LsmStorageInner {
                         output.len(),
                         output
                     );
+                    let mut table_ids = Vec::new();
+                    for table in new_state.imm_memtables.iter() {
+                        table_ids.push(table.id());
+                    }
+                    println!("imm_memtable {:?}", table_ids);
+                    println!("l0 sst_tables {:?}", new_state.l0_sstables.clone());
                     for level in new_state.levels.iter() {
                         println!("level {} sst {:?}", level.0, level.1);
                     }
