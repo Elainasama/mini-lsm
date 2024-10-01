@@ -423,7 +423,7 @@ impl LsmStorageInner {
     }
 
     pub fn sync(&self) -> Result<()> {
-        unimplemented!()
+        self.state.read().memtable.sync_wal()
     }
 
     pub fn add_compaction_filter(&self, compaction_filter: CompactionFilter) {
@@ -535,7 +535,17 @@ impl LsmStorageInner {
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
     pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
-        unimplemented!()
+        for record in _batch {
+            match record {
+                WriteBatchRecord::Put(key, val) => {
+                    self.put(key.as_ref(), val.as_ref())?;
+                }
+                WriteBatchRecord::Del(key) => {
+                    self.delete(key.as_ref())?;
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn check_over_capacity(&self, _key: &[u8], _value: &[u8]) -> bool {

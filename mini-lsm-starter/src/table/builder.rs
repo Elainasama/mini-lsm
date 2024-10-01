@@ -61,7 +61,11 @@ impl SsTableBuilder {
         let new_builder = BlockBuilder::new(self.block_size);
         let old_builder = std::mem::replace(&mut self.builder, new_builder);
         let offset = self.data.len();
-        self.data.extend(old_builder.build().encode());
+        let block_data = old_builder.build().encode();
+        // checksum
+        let hash = crc32fast::hash(&block_data);
+        self.data.extend(block_data);
+        self.data.put_u32(hash);
         self.meta.push(BlockMeta {
             offset,
             first_key: std::mem::take(&mut self.first_key).into_key_bytes(),

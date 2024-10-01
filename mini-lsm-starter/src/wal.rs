@@ -15,6 +15,7 @@ pub struct Wal {
 }
 
 const SIZE_U16: usize = std::mem::size_of::<u16>();
+const SIZE_U32: usize = std::mem::size_of::<u32>();
 
 impl Wal {
     pub fn create(_path: impl AsRef<Path>) -> Result<Self> {
@@ -40,6 +41,15 @@ impl Wal {
             let val_len = data.get_u16();
             let val = &data[..val_len as usize];
             data.advance(val_len as usize);
+            // checksum
+            let mut hasher: Vec<u8> =
+                Vec::with_capacity(2 * SIZE_U16 + key_len as usize + val_len as usize);
+            hasher.put_u16(key_len);
+            hasher.put_slice(key);
+            hasher.put_u16(val_len);
+            hasher.put_slice(val);
+            let hash = data.get_u32();
+            assert_eq!(hash, crc32fast::hash(&hasher), "Wal data corruption!!!");
             _skiplist.insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(val));
         }
         Ok(Self {
@@ -49,11 +59,14 @@ impl Wal {
 
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
         let file = self.file.lock();
-        let mut buf = Vec::with_capacity(2 * SIZE_U16 + _key.len() + _value.len());
+        let mut buf = Vec::with_capacity(2 * SIZE_U16 + _key.len() + _value.len() + SIZE_U32);
         buf.put_u16(_key.len() as u16);
         buf.put_slice(_key);
         buf.put_u16(_value.len() as u16);
         buf.put_slice(_value);
+        // checksum
+        let hash = crc32fast::hash(&buf);
+        buf.put_u32(hash);
         file.get_ref().write_all(&buf)?;
         Ok(())
     }

@@ -57,6 +57,8 @@ impl BlockMeta {
             // last key
             add_size += meta.last_key.len();
         }
+        // checksum
+        add_size += SIZE_U32;
 
         // 预分配空间
         buf.reserve(add_size);
@@ -71,13 +73,22 @@ impl BlockMeta {
             buf.put_u16(last_key_len as u16);
             buf.extend(meta.last_key.raw_ref());
         }
-
+        // checksum
+        let check_sum = crc32fast::hash(&buf[origin_size..]);
+        buf.put_u32(check_sum);
         assert_eq!(buf.len() - origin_size, add_size);
     }
 
     /// Decode block meta from a buffer.
-    pub fn decode_block_meta(mut buf: impl Buf) -> Vec<BlockMeta> {
+    pub fn decode_block_meta(mut buf: &[u8]) -> Vec<BlockMeta> {
         let mut meta_vec = Vec::new();
+        // checksum
+        let check_sum = (&buf[(buf.remaining() - SIZE_U32)..buf.remaining()]).get_u32();
+        assert_eq!(
+            check_sum,
+            crc32fast::hash(&buf[..(buf.remaining() - SIZE_U32)]),
+            "Block meta data corruption!!!"
+        );
         let num_meta = buf.get_u32();
         for _ in 0..num_meta {
             let block_offset = buf.get_u32();
@@ -213,7 +224,14 @@ impl SsTable {
         let data = self
             .file
             .read(block_offset as u64, (end - block_offset) as u64)?;
-        Ok(Arc::new(Block::decode(&data)))
+        // checksum
+        let checksum = (&data[data.len() - SIZE_U32..]).get_u32();
+        assert_eq!(
+            checksum,
+            crc32fast::hash(&data[..(data.len() - SIZE_U32)]),
+            "Block data corruption!!!"
+        );
+        Ok(Arc::new(Block::decode(&data[..(data.len() - SIZE_U32)])))
     }
 
     /// Read a block from disk, with block cache. (Day 4)

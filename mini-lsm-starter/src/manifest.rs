@@ -6,6 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use bytes::{Buf, BufMut};
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
@@ -21,7 +22,7 @@ pub enum ManifestRecord {
     NewMemtable(usize),
     Compaction(CompactionTask, Vec<usize>),
 }
-
+const SIZE_U32: usize = std::mem::size_of::<u32>();
 impl Manifest {
     pub fn create(_path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
@@ -39,9 +40,24 @@ impl Manifest {
 
         file.read_to_end(&mut data)?;
         let mut records = Vec::new();
-        for stream in serde_json::Deserializer::from_slice(&data[..]).into_iter::<ManifestRecord>()
-        {
-            records.push(stream?);
+        // for stream in serde_json::Deserializer::from_slice(&data[..]).into_iter::<ManifestRecord>()
+        // {
+        //     records.push(stream?);
+        // }
+
+        // checksum
+        let mut buf = &data[..];
+        while buf.has_remaining() {
+            let len = buf.get_u32();
+            let check_sum = (&buf[len as usize - SIZE_U32..len as usize]).get_u32();
+            let record_data = &buf[..len as usize - SIZE_U32];
+            assert_eq!(
+                check_sum,
+                crc32fast::hash(record_data),
+                "Manifest data corruption!!!"
+            );
+            records.push(serde_json::from_slice::<ManifestRecord>(record_data)?);
+            buf.advance(len as usize);
         }
         Ok((
             Self {
@@ -60,8 +76,12 @@ impl Manifest {
     }
 
     pub fn add_record_when_init(&self, _record: ManifestRecord) -> Result<()> {
-        let json = serde_json::to_vec(&_record)?;
+        let mut json = serde_json::to_vec(&_record)?;
+        // checksum
+        let hash = crc32fast::hash(&json);
+        json.put_u32(hash);
         let mut file = self.file.lock();
+        file.write_all(&(json.len() as u32).to_be_bytes())?;
         file.write_all(&json)?;
         file.sync_all()?;
         Ok(())
