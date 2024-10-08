@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::{BlockMeta, FileObject, SsTable};
-use crate::key::{Key, KeyVec};
+use crate::key::{KeyVec};
 use crate::table::bloom::Bloom;
 use crate::{block::BlockBuilder, key::KeySlice, lsm_storage::BlockCache};
 use anyhow::Result;
@@ -28,7 +28,7 @@ impl SsTableBuilder {
         Self {
             builder: BlockBuilder::new(block_size),
             first_key: KeyVec::new(),
-            last_key: Key::new(),
+            last_key: KeyVec::new(),
             data: Vec::new(),
             meta: Vec::new(),
             block_size,
@@ -51,7 +51,7 @@ impl SsTableBuilder {
             self.first_key = key.to_key_vec();
         }
         self.last_key = key.to_key_vec();
-        self.key_hash.push(farmhash::fingerprint32(key.raw_ref()));
+        self.key_hash.push(farmhash::fingerprint32(key.key_ref()));
     }
 
     fn finish_block(&mut self) {

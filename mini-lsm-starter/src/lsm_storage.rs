@@ -18,7 +18,7 @@ use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
-use crate::key::KeySlice;
+use crate::key::{KeySlice, TS_DEFAULT, TS_RANGE_BEGIN, TS_RANGE_END};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{map_bound, MemTable};
@@ -465,7 +465,7 @@ impl LsmStorageInner {
                     continue;
                 }
             }
-            let key = KeySlice::from_slice(_key);
+            let key = KeySlice::from_slice(_key, TS_DEFAULT);
             // 快速判断
             if table.first_key().as_key_slice() <= key && key <= table.last_key().as_key_slice() {
                 let iter = SsTableIterator::create_and_seek_to_key(table, key)?;
@@ -502,7 +502,7 @@ impl LsmStorageInner {
                 let mid = (left + right) / 2;
                 let sst_id = &snapshot.levels[level].1[mid];
                 let table = snapshot.sstables.get(sst_id).unwrap().clone();
-                if table.first_key().as_key_slice() <= KeySlice::from_slice(_key) {
+                if table.first_key().as_key_slice() <= KeySlice::from_slice(_key, TS_DEFAULT) {
                     left = mid + 1;
                 } else {
                     right = mid;
@@ -518,7 +518,7 @@ impl LsmStorageInner {
                         continue;
                     }
                 }
-                let key = KeySlice::from_slice(_key);
+                let key = KeySlice::from_slice(_key, TS_DEFAULT);
                 let iter = SsTableIterator::create_and_seek_to_key(table, key)?;
                 if iter.is_valid() && iter.key() == key {
                     // 订正，删除墓碑只有在level的最后一层可以去掉。
@@ -680,12 +680,12 @@ impl LsmStorageInner {
     ) -> bool {
         match lower {
             Bound::Included(x) => {
-                if end < KeySlice::from_slice(x) {
+                if end < KeySlice::from_slice(x, TS_DEFAULT) {
                     return false;
                 }
             }
             Bound::Excluded(x) => {
-                if end <= KeySlice::from_slice(x) {
+                if end <= KeySlice::from_slice(x, TS_DEFAULT) {
                     return false;
                 }
             }
@@ -693,12 +693,12 @@ impl LsmStorageInner {
         }
         match upper {
             Bound::Included(x) => {
-                if begin > KeySlice::from_slice(x) {
+                if begin > KeySlice::from_slice(x, TS_DEFAULT) {
                     return false;
                 }
             }
             Bound::Excluded(x) => {
-                if begin >= KeySlice::from_slice(x) {
+                if begin >= KeySlice::from_slice(x, TS_DEFAULT) {
                     return false;
                 }
             }
@@ -737,15 +737,16 @@ impl LsmStorageInner {
                 table.last_key().as_key_slice(),
             ) {
                 let iter = match _lower {
-                    Bound::Included(x) => {
-                        SsTableIterator::create_and_seek_to_key(table, KeySlice::from_slice(x))?
-                    }
+                    Bound::Included(x) => SsTableIterator::create_and_seek_to_key(
+                        table,
+                        KeySlice::from_slice(x, TS_DEFAULT),
+                    )?,
                     Bound::Excluded(x) => {
                         let mut iter = SsTableIterator::create_and_seek_to_key(
                             table,
-                            KeySlice::from_slice(x),
+                            KeySlice::from_slice(x, TS_DEFAULT),
                         )?;
-                        if iter.is_valid() && iter.key() == KeySlice::from_slice(x) {
+                        if iter.is_valid() && iter.key() == KeySlice::from_slice(x, TS_DEFAULT) {
                             iter.next()?
                         }
                         iter

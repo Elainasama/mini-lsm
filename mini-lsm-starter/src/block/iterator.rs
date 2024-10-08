@@ -1,7 +1,7 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use super::Block;
+use super::{Block, SIZE_U64};
 use crate::key::{Key, KeySlice, KeyVec};
 use bytes::Buf;
 use std::sync::Arc;
@@ -77,15 +77,17 @@ impl BlockIterator {
         // offset += 2;
         // self.key = Key::from_vec(self.block.data[(offset)..(offset + key_len as usize)].to_vec());
 
-        // key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len)
+        // key_overlap_len (u16) | rest_key_len (u16) | key (rest_key_len) | ts(u64)
         let key_overlap_len = (&self.block.data[offset..offset + SIZE_U16]).get_u16();
         offset += SIZE_U16;
         let key_rest_len = (&self.block.data[offset..offset + SIZE_U16]).get_u16();
         offset += SIZE_U16;
-        let mut key = self.first_key.raw_ref()[..key_overlap_len as usize].to_vec();
+        let mut key = self.first_key.key_ref()[..key_overlap_len as usize].to_vec();
         key.extend(self.block.data[offset..offset + key_rest_len as usize].to_vec());
-        self.key = Key::from_vec(key);
         offset += key_rest_len as usize;
+        let ts = (&self.block.data[offset..offset + SIZE_U64]).get_u64();
+        self.key = Key::from_vec_with_ts(key, ts);
+        offset += SIZE_U64;
         let val_len = (&self.block.data[offset..offset + SIZE_U16]).get_u16();
         offset += SIZE_U16;
         self.value_range = (offset, offset + val_len as usize);

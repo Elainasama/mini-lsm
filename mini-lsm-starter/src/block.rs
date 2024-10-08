@@ -15,7 +15,7 @@ pub struct Block {
 }
 
 const SIZE_U16: usize = std::mem::size_of::<u16>();
-
+const SIZE_U64: usize = std::mem::size_of::<u64>();
 impl Block {
     /// Encode the internal data to the data layout illustrated in the tutorial
     /// Note: You may want to recheck if any of the expected field is missing from your output
