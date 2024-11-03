@@ -21,19 +21,41 @@ type LsmIteratorInner = TwoMergeIterator<
 pub struct LsmIterator {
     inner: LsmIteratorInner,
     end: Bound<Bytes>,
+    pre_key: Vec<u8>,
+    read_ts: u64,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner, end: Bound<Bytes>) -> Result<Self> {
-        let mut this = Self { inner: iter, end };
-        this.move_to_non_delete()?;
+    pub(crate) fn new(iter: LsmIteratorInner, end: Bound<Bytes>, ts: u64) -> Result<Self> {
+        let mut this = Self {
+            inner: iter,
+            end,
+            pre_key: vec![],
+            read_ts: ts,
+        };
+        this.move_to_nxt_key()?;
         Ok(this)
     }
 
-    fn move_to_non_delete(&mut self) -> Result<()> {
+    fn move_to_nxt_key(&mut self) -> Result<()> {
         // 忽略已经删除的键值对,最开始的值也可能是被删除的。
-        while self.inner.is_valid() && self.inner.value().is_empty() {
-            self.inner.next()?;
+        // 跳过超越read_ts时间戳的键
+        loop {
+            while self.inner.is_valid()
+                && (self.inner.key().ts() > self.read_ts
+                    || self.inner.key().key_ref() == self.pre_key)
+            {
+                self.inner.next()?;
+            }
+            if !self.inner.is_valid() {
+                break;
+            }
+            self.pre_key.clear();
+            self.pre_key.extend(self.inner.key().key_ref());
+            if self.inner.value().is_empty() {
+                continue;
+            }
+            break;
         }
         Ok(())
     }
@@ -55,7 +77,7 @@ impl StorageIterator for LsmIterator {
     }
 
     fn key(&self) -> &[u8] {
-        self.inner.key().into_inner()
+        self.inner.key().key_ref()
     }
 
     fn is_valid(&self) -> bool {
@@ -64,7 +86,7 @@ impl StorageIterator for LsmIterator {
 
     fn next(&mut self) -> Result<()> {
         self.inner.next()?;
-        self.move_to_non_delete()?;
+        self.move_to_nxt_key()?;
         Ok(())
     }
 

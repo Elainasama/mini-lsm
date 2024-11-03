@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::StorageIterator;
+use crate::key::KeyVec;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
 use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
@@ -118,13 +119,17 @@ impl LsmStorageInner {
         let mut iter = MergeIterator::create(sst_iters);
         let mut new_sst = Vec::new();
         let mut builder = SsTableBuilder::new(self.options.block_size);
+        // same key in the same SST
+        let mut pre_key = KeyVec::new();
         while iter.is_valid() {
             // 只有最后一层可以删除delete墓碑。
-            if !is_bottom || !iter.value().is_empty() {
+            // todo 暂时删去删除墓碑的逻辑
+            if !is_bottom || !iter.value().is_empty() || true {
                 let key = iter.key();
                 let value = iter.value();
-                builder.add(key, value);
-                if builder.estimated_size() > self.options.target_sst_size {
+                if builder.estimated_size() > self.options.target_sst_size
+                    && key.key_ref() != pre_key.key_ref()
+                {
                     let old_builder = std::mem::replace(
                         &mut builder,
                         SsTableBuilder::new(self.options.block_size),
@@ -136,6 +141,8 @@ impl LsmStorageInner {
                         self.path_of_sst(id),
                     )?));
                 }
+                builder.add(key, value);
+                pre_key = key.to_key_vec();
             }
             iter.next()?
         }

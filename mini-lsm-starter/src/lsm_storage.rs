@@ -18,10 +18,10 @@ use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
-use crate::key::{KeySlice, TS_DEFAULT, TS_RANGE_BEGIN, TS_RANGE_END};
+use crate::key::{KeySlice, TS_RANGE_BEGIN, TS_RANGE_END};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
-use crate::mem_table::{map_bound, MemTable};
+use crate::mem_table::{map_bound, map_bytes_bound_with_ts, MemTable};
 use crate::mvcc::LsmMvccInner;
 use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 use anyhow::{anyhow, Result};
@@ -264,6 +264,10 @@ impl LsmStorageInner {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
     }
 
+    pub(crate) fn mvcc(&self) -> &LsmMvccInner {
+        self.mvcc.as_ref().unwrap()
+    }
+
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
     /// not exist.
     pub(crate) fn open(path: impl AsRef<Path>, options: LsmStorageOptions) -> Result<Self> {
@@ -415,7 +419,7 @@ impl LsmStorageInner {
             compaction_controller,
             manifest,
             options: options.into(),
-            mvcc: None,
+            mvcc: Some(LsmMvccInner::new(0)),
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
         };
 
@@ -433,28 +437,56 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
+        let ts = self.mvcc().latest_commit_ts();
+        self.get_with_ts(_key, ts)
+    }
+    pub fn get_with_ts(&self, _key: &[u8], read_ts: u64) -> Result<Option<Bytes>> {
+        let key = KeySlice::from_slice(_key, read_ts);
         let snapshot = {
             let guard = self.state.read();
             Arc::clone(&guard)
         };
 
         // memtables
-        if let Some(value) = snapshot.memtable.get(_key) {
-            // In the mini-lsm implementation,
-            // deletion is represented as a key corresponding to an empty value.
-            if value.is_empty() {
+        let mem_iter = snapshot.memtable.scan(
+            Bound::Included(KeySlice::from_slice(_key, read_ts)),
+            Bound::Included(KeySlice::from_slice(_key, TS_RANGE_END)),
+        );
+        if mem_iter.is_valid() && mem_iter.key().key_ref() == _key {
+            if mem_iter.value().is_empty() {
                 return Ok(None);
             }
-            return Ok(Some(value));
+            return Ok(Some(Bytes::copy_from_slice(mem_iter.value())));
         }
         for table in &snapshot.imm_memtables {
-            if let Some(value) = table.get(_key) {
-                if value.is_empty() {
+            let immem_iter = table.scan(
+                Bound::Included(KeySlice::from_slice(_key, read_ts)),
+                Bound::Included(KeySlice::from_slice(_key, TS_RANGE_END)),
+            );
+            if immem_iter.is_valid() && immem_iter.key().key_ref() == _key {
+                if immem_iter.value().is_empty() {
                     return Ok(None);
                 }
-                return Ok(Some(value));
+                return Ok(Some(Bytes::copy_from_slice(immem_iter.value())));
             }
         }
+
+        // if let Some(value) = snapshot.memtable.get(key) {
+        //     // In the mini-lsm implementation,
+        //     // deletion is represented as a key corresponding to an empty value.
+        //     if value.is_empty() {
+        //         return Ok(None);
+        //     }
+        //     return Ok(Some(value));
+        // }
+        // for table in &snapshot.imm_memtables {
+        //     if let Some(value) = table.get(key) {
+        //         if value.is_empty() {
+        //             return Ok(None);
+        //         }
+        //         return Ok(Some(value));
+        //     }
+        // }
 
         // l0_sst
         for sst_id in snapshot.l0_sstables.iter() {
@@ -465,11 +497,11 @@ impl LsmStorageInner {
                     continue;
                 }
             }
-            let key = KeySlice::from_slice(_key, TS_DEFAULT);
+
             // 快速判断
-            if table.first_key().as_key_slice() <= key && key <= table.last_key().as_key_slice() {
+            if table.first_key().key_ref() <= _key && _key <= table.last_key().key_ref() {
                 let iter = SsTableIterator::create_and_seek_to_key(table, key)?;
-                if iter.is_valid() && iter.key() == key {
+                if iter.is_valid() && iter.key().key_ref() == _key {
                     if iter.value().is_empty() {
                         return Ok(None);
                     }
@@ -502,7 +534,7 @@ impl LsmStorageInner {
                 let mid = (left + right) / 2;
                 let sst_id = &snapshot.levels[level].1[mid];
                 let table = snapshot.sstables.get(sst_id).unwrap().clone();
-                if table.first_key().as_key_slice() <= KeySlice::from_slice(_key, TS_DEFAULT) {
+                if table.first_key().key_ref() <= _key {
                     left = mid + 1;
                 } else {
                     right = mid;
@@ -518,9 +550,8 @@ impl LsmStorageInner {
                         continue;
                     }
                 }
-                let key = KeySlice::from_slice(_key, TS_DEFAULT);
                 let iter = SsTableIterator::create_and_seek_to_key(table, key)?;
-                if iter.is_valid() && iter.key() == key {
+                if iter.is_valid() && iter.key().key_ref() == _key {
                     // 订正，删除墓碑只有在level的最后一层可以去掉。
                     if iter.value().is_empty() {
                         return Ok(None);
@@ -535,16 +566,19 @@ impl LsmStorageInner {
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
     pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
+        let _lock = self.mvcc().write_lock.lock();
+        let ts = self.mvcc().latest_commit_ts() + 1;
         for record in _batch {
             match record {
                 WriteBatchRecord::Put(key, val) => {
-                    self.put(key.as_ref(), val.as_ref())?;
+                    self.put_with_ts(key.as_ref(), val.as_ref(), ts)?;
                 }
                 WriteBatchRecord::Del(key) => {
-                    self.delete(key.as_ref())?;
+                    self.delete_with_ts(key.as_ref(), ts)?;
                 }
             }
         }
+        self.mvcc().update_commit_ts(ts);
         Ok(())
     }
 
@@ -555,6 +589,9 @@ impl LsmStorageInner {
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
+        self.write_batch(&[WriteBatchRecord::Put(_key, _value)])
+    }
+    pub fn put_with_ts(&self, _key: &[u8], _value: &[u8], ts: u64) -> Result<()> {
         // 超过memtable的容量
         if self.check_over_capacity(_key, _value) {
             let state_lock = self.state_lock.lock();
@@ -563,12 +600,19 @@ impl LsmStorageInner {
             }
         }
         // 可以支持不可变引用更新
-        self.state.read().memtable.put(_key, _value)
+        self.state
+            .read()
+            .memtable
+            .put(KeySlice::from_slice(_key, ts), _value)
     }
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        self.put(_key, &[])
+        self.write_batch(&[WriteBatchRecord::Del(_key)])
+    }
+
+    pub fn delete_with_ts(&self, _key: &[u8], ts: u64) -> Result<()> {
+        self.put_with_ts(_key, &[], ts)
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -680,12 +724,12 @@ impl LsmStorageInner {
     ) -> bool {
         match lower {
             Bound::Included(x) => {
-                if end < KeySlice::from_slice(x, TS_DEFAULT) {
+                if end.key_ref() < x {
                     return false;
                 }
             }
             Bound::Excluded(x) => {
-                if end <= KeySlice::from_slice(x, TS_DEFAULT) {
+                if end.key_ref() <= x {
                     return false;
                 }
             }
@@ -693,12 +737,12 @@ impl LsmStorageInner {
         }
         match upper {
             Bound::Included(x) => {
-                if begin > KeySlice::from_slice(x, TS_DEFAULT) {
+                if begin.key_ref() > x {
                     return false;
                 }
             }
             Bound::Excluded(x) => {
-                if begin >= KeySlice::from_slice(x, TS_DEFAULT) {
+                if begin.key_ref() >= x {
                     return false;
                 }
             }
@@ -713,6 +757,15 @@ impl LsmStorageInner {
         _lower: Bound<&[u8]>,
         _upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
+        let ts = self.mvcc().latest_commit_ts();
+        self.scan_with_ts(_lower, _upper, ts)
+    }
+    pub fn scan_with_ts(
+        &self,
+        _lower: Bound<&[u8]>,
+        _upper: Bound<&[u8]>,
+        ts: u64,
+    ) -> Result<FusedIterator<LsmIterator>> {
         // 这里不上读锁，自身数据结构不可变的Arc可以实现并发的读写。
         let snapshot = {
             let guard = self.state.read();
@@ -720,12 +773,28 @@ impl LsmStorageInner {
         };
         // memtable
         let mut memtable_iters = Vec::with_capacity(snapshot.imm_memtables.len() + 1);
-        memtable_iters.push(Box::new(snapshot.memtable.scan(_lower, _upper)));
+        memtable_iters.push(Box::new(snapshot.memtable.scan(
+            map_bytes_bound_with_ts(_lower, TS_RANGE_BEGIN),
+            map_bytes_bound_with_ts(_upper, TS_RANGE_END),
+        )));
 
         for memtable in &snapshot.imm_memtables {
-            memtable_iters.push(Box::new(memtable.scan(_lower, _upper)));
+            memtable_iters.push(Box::new(memtable.scan(
+                map_bytes_bound_with_ts(_lower, TS_RANGE_BEGIN),
+                map_bytes_bound_with_ts(_upper, TS_RANGE_END),
+            )));
         }
-
+        // todo solve memtable exclude
+        // test week1day6 感觉memtable是需要做lower处理的。
+        let mut mem_merge_iter = MergeIterator::create(memtable_iters);
+        match _lower {
+            Bound::Excluded(x) => {
+                while mem_merge_iter.is_valid() && mem_merge_iter.key().key_ref() == x {
+                    mem_merge_iter.next()?
+                }
+            }
+            _ => {}
+        }
         // l0-sst
         let mut l0_sst_iters = Vec::with_capacity(snapshot.l0_sstables.len());
         for sst_id in snapshot.l0_sstables.iter() {
@@ -737,17 +806,16 @@ impl LsmStorageInner {
                 table.last_key().as_key_slice(),
             ) {
                 let iter = match _lower {
-                    Bound::Included(x) => SsTableIterator::create_and_seek_to_key(
-                        table,
-                        KeySlice::from_slice(x, TS_DEFAULT),
-                    )?,
+                    Bound::Included(x) => {
+                        SsTableIterator::create_and_seek_to_key(table, KeySlice::from_slice(x, ts))?
+                    }
                     Bound::Excluded(x) => {
                         let mut iter = SsTableIterator::create_and_seek_to_key(
                             table,
-                            KeySlice::from_slice(x, TS_DEFAULT),
+                            KeySlice::from_slice(x, TS_RANGE_END),
                         )?;
-                        if iter.is_valid() && iter.key() == KeySlice::from_slice(x, TS_DEFAULT) {
-                            iter.next()?
+                        if iter.is_valid() && iter.key().key_ref() == x {
+                            iter.next()?;
                         }
                         iter
                     }
@@ -758,6 +826,7 @@ impl LsmStorageInner {
             }
         }
 
+        // fix bug: 应该直接seek_to_key的
         // level-sst
         let mut level_iters = Vec::with_capacity(snapshot.levels.len());
         for level in 0..snapshot.levels.len() {
@@ -766,19 +835,33 @@ impl LsmStorageInner {
                 level_sst.push(snapshot.sstables.get(id).unwrap().clone());
             }
 
-            level_iters.push(Box::new(SstConcatIterator::create_and_seek_to_first(
-                level_sst,
-            )?));
+            let iter = match _lower {
+                Bound::Included(x) => SstConcatIterator::create_and_seek_to_key(
+                    level_sst,
+                    KeySlice::from_slice(x, ts),
+                )?,
+                Bound::Excluded(x) => {
+                    let mut iter = SstConcatIterator::create_and_seek_to_key(
+                        level_sst,
+                        KeySlice::from_slice(x, TS_RANGE_END),
+                    )?;
+                    if iter.is_valid() && iter.key().key_ref() == x {
+                        iter.next()?;
+                    }
+                    iter
+                }
+                Bound::Unbounded => SstConcatIterator::create_and_seek_to_first(level_sst)?,
+            };
+            level_iters.push(Box::new(iter));
         }
-        let two_merge_iter = TwoMergeIterator::create(
-            MergeIterator::create(memtable_iters),
-            MergeIterator::create(l0_sst_iters),
-        )?;
+        let two_merge_iter =
+            TwoMergeIterator::create(mem_merge_iter, MergeIterator::create(l0_sst_iters))?;
 
         // 右边界upper通过LsmIterator上层终止,之前的代码并未测试到这里。
         Ok(FusedIterator::new(LsmIterator::new(
             TwoMergeIterator::create(two_merge_iter, MergeIterator::create(level_iters))?,
             map_bound(_upper),
+            ts,
         )?))
     }
 }
