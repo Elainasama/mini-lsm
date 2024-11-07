@@ -41,6 +41,7 @@ impl BlockMeta {
         block_meta: &[BlockMeta],
         #[allow(clippy::ptr_arg)] // remove this allow after you finish
         buf: &mut Vec<u8>,
+        max_ts: u64,
     ) {
         // meta_len
         let mut add_size = SIZE_U32;
@@ -59,6 +60,8 @@ impl BlockMeta {
         }
         // checksum
         add_size += SIZE_U32;
+        // max_ts
+        add_size += SIZE_U64;
 
         // 预分配空间
         buf.reserve(add_size);
@@ -75,6 +78,7 @@ impl BlockMeta {
             buf.extend(meta.last_key.key_ref());
             buf.put_u64(meta.last_key.ts());
         }
+        buf.put_u64(max_ts);
         // checksum
         let check_sum = crc32fast::hash(&buf[origin_size..]);
         buf.put_u32(check_sum);
@@ -82,7 +86,7 @@ impl BlockMeta {
     }
 
     /// Decode block meta from a buffer.
-    pub fn decode_block_meta(mut buf: &[u8]) -> Vec<BlockMeta> {
+    pub fn decode_block_meta(mut buf: &[u8]) -> (Vec<BlockMeta>, u64) {
         let mut meta_vec = Vec::new();
         // checksum
         let check_sum = (&buf[(buf.remaining() - SIZE_U32)..buf.remaining()]).get_u32();
@@ -108,8 +112,8 @@ impl BlockMeta {
                 last_key,
             })
         }
-
-        meta_vec
+        let max_ts = buf.get_u64();
+        (meta_vec, max_ts)
     }
 }
 
@@ -186,7 +190,7 @@ impl SsTable {
             bloom_offset - SIZE_U32 as u64 - block_meta_offset,
         )?;
         // metadata add bloom
-        let block_meta = BlockMeta::decode_block_meta(&block_meta_data[..]);
+        let (block_meta, max_ts) = BlockMeta::decode_block_meta(&block_meta_data[..]);
         Ok(Self {
             file,
             block_meta_offset: block_meta_offset as usize,
@@ -196,7 +200,7 @@ impl SsTable {
             block_cache,
             block_meta,
             bloom: Some(bloom),
-            max_ts: 0,
+            max_ts,
         })
     }
 

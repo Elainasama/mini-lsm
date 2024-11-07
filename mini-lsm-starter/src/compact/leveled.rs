@@ -39,9 +39,9 @@ impl LeveledCompactionController {
         let target_sst_ids = &_snapshot.levels[_in_level - 1].1;
         let first_key = _snapshot.sstables.get(&_sst_ids[0]).unwrap().first_key();
         let last_key = _snapshot.sstables.get(&_sst_ids[0]).unwrap().last_key();
-        target_sst_ids[self.find_first_key_overlapping_idx(first_key, _snapshot, target_sst_ids)
-            ..self.find_last_key_overlapping_idx(last_key, _snapshot, target_sst_ids)]
-            .to_vec()
+        let start = self.find_first_key_overlapping_idx(first_key, _snapshot, target_sst_ids);
+        let end = self.find_last_key_overlapping_idx(last_key, _snapshot, target_sst_ids);
+        target_sst_ids[start..end].to_vec()
     }
     fn find_first_key_overlapping_idx(
         &self,

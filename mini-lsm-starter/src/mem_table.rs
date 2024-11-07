@@ -20,7 +20,7 @@ use crate::wal::Wal;
 /// An initial implementation of memtable is part of week 1, day 1. It will be incrementally implemented in other
 /// chapters of week 1 and week 2.
 pub struct MemTable {
-    map: Arc<SkipMap<KeyBytes, Bytes>>,
+    pub(crate) map: Arc<SkipMap<KeyBytes, Bytes>>,
     wal: Option<Wal>,
     id: usize,
     approximate_size: Arc<AtomicUsize>,
@@ -114,7 +114,7 @@ impl MemTable {
     /// Get a value by key.
     pub fn get(&self, _key: KeySlice) -> Option<Bytes> {
         let entry = self.map.get(&KeyBytes::from_bytes_with_ts(
-            Bytes::from_static(unsafe { std::mem::transmute(_key.key_ref()) }),
+            Bytes::from_static(unsafe { std::mem::transmute::<&[u8], &[u8]>(_key.key_ref()) }),
             _key.ts(),
         ))?;
         Some(entry.value().clone())

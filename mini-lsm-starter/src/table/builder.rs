@@ -1,11 +1,12 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
+use std::cmp::max;
 use std::path::Path;
 use std::sync::Arc;
 
 use super::{BlockMeta, FileObject, SsTable};
-use crate::key::{KeyVec};
+use crate::key::{KeyVec, TS_MIN};
 use crate::table::bloom::Bloom;
 use crate::{block::BlockBuilder, key::KeySlice, lsm_storage::BlockCache};
 use anyhow::Result;
@@ -20,6 +21,7 @@ pub struct SsTableBuilder {
     pub(crate) meta: Vec<BlockMeta>,
     block_size: usize,
     key_hash: Vec<u32>,
+    max_ts: u64,
 }
 
 impl SsTableBuilder {
@@ -33,6 +35,7 @@ impl SsTableBuilder {
             meta: Vec::new(),
             block_size,
             key_hash: Vec::new(),
+            max_ts: TS_MIN,
         }
     }
 
@@ -52,6 +55,7 @@ impl SsTableBuilder {
         }
         self.last_key = key.to_key_vec();
         self.key_hash.push(farmhash::fingerprint32(key.key_ref()));
+        self.max_ts = max(self.max_ts, key.ts());
     }
 
     fn finish_block(&mut self) {
@@ -94,7 +98,7 @@ impl SsTableBuilder {
         // | data block | ... | data block |   metadata   | meta block offset (u32) |
         let block_meta_offset = self.data.len();
         let mut buf = self.data;
-        BlockMeta::encode_block_meta(&self.meta, &mut buf);
+        BlockMeta::encode_block_meta(&self.meta, &mut buf, self.max_ts);
         buf.put_u32(block_meta_offset as u32);
         //  add bloom
         let bloom = Bloom::build_from_key_hashes(
@@ -115,7 +119,7 @@ impl SsTableBuilder {
             last_key: self.meta.last().unwrap().last_key.clone(),
             block_meta: self.meta,
             bloom: Some(bloom),
-            max_ts: 0,
+            max_ts: self.max_ts,
         })
     }
     pub fn is_empty(&self) -> bool {

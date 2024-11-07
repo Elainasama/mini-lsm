@@ -18,10 +18,11 @@ use crate::iterators::concat_iterator::SstConcatIterator;
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::two_merge_iterator::TwoMergeIterator;
 use crate::iterators::StorageIterator;
-use crate::key::{KeySlice, TS_RANGE_BEGIN, TS_RANGE_END};
+use crate::key::{KeySlice, TS_MIN, TS_RANGE_BEGIN, TS_RANGE_END};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::{Manifest, ManifestRecord};
 use crate::mem_table::{map_bound, map_bytes_bound_with_ts, MemTable};
+use crate::mvcc::txn::{Transaction, TxnIterator};
 use crate::mvcc::LsmMvccInner;
 use crate::table::{FileObject, SsTable, SsTableBuilder, SsTableIterator};
 use anyhow::{anyhow, Result};
@@ -205,7 +206,7 @@ impl MiniLsm {
         }))
     }
 
-    pub fn new_txn(&self) -> Result<()> {
+    pub fn new_txn(&self) -> Result<Arc<Transaction>> {
         self.inner.new_txn()
     }
 
@@ -233,11 +234,7 @@ impl MiniLsm {
         self.inner.sync()
     }
 
-    pub fn scan(
-        &self,
-        lower: Bound<&[u8]>,
-        upper: Bound<&[u8]>,
-    ) -> Result<FusedIterator<LsmIterator>> {
+    pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
         self.inner.scan(lower, upper)
     }
 
@@ -292,6 +289,7 @@ impl LsmStorageInner {
             fs::create_dir(path)?;
         }
 
+        let mut init_ts = TS_MIN;
         let (next_sst_id, manifest) = {
             if !manifest_path.exists() {
                 File::create(manifest_path.as_path())?;
@@ -329,6 +327,10 @@ impl LsmStorageInner {
                             memtable_ids.push(id);
                         }
                         ManifestRecord::Compaction(task, output) => {
+                            // 不要忘记压缩也会生成新的sst_id
+                            for id in &output {
+                                max_sst_id = max(max_sst_id, *id);
+                            }
                             let (new_state, _) = compaction_controller.apply_compaction_result(
                                 &state,
                                 &task,
@@ -352,28 +354,30 @@ impl LsmStorageInner {
                 }
                 // memtable_ids
                 for id in memtable_ids {
-                    state
-                        .imm_memtables
-                        .push(Arc::new(MemTable::recover_from_wal(
-                            id,
-                            Self::path_of_wal_static(path, id),
-                        )?));
+                    let table = MemTable::recover_from_wal(id, Self::path_of_wal_static(path, id))?;
+                    let max_ts = table
+                        .map
+                        .iter()
+                        .map(|x| x.key().ts())
+                        .max()
+                        .unwrap_or(TS_MIN);
+                    init_ts = max(init_ts, max_ts);
+                    state.imm_memtables.push(Arc::new(table));
                 }
                 // 将存在的sst表加入sst_table中
+                // 恢复后的事务时间戳 init_ts
                 for l0_id in state.l0_sstables.clone() {
                     let file = FileObject::open(&Self::path_of_sst_static(path, l0_id))?;
-                    state.sstables.insert(
-                        l0_id,
-                        Arc::new(SsTable::open(l0_id, Some(block_cache.clone()), file)?),
-                    );
+                    let table = SsTable::open(l0_id, Some(block_cache.clone()), file)?;
+                    init_ts = max(init_ts, table.max_ts());
+                    state.sstables.insert(l0_id, Arc::new(table));
                 }
                 for level in &state.levels {
                     for sst_id in level.1.clone() {
                         let file = FileObject::open(&Self::path_of_sst_static(path, sst_id))?;
-                        state.sstables.insert(
-                            sst_id,
-                            Arc::new(SsTable::open(sst_id, Some(block_cache.clone()), file)?),
-                        );
+                        let table = SsTable::open(sst_id, Some(block_cache.clone()), file)?;
+                        init_ts = max(init_ts, table.max_ts());
+                        state.sstables.insert(sst_id, Arc::new(table));
                     }
                 }
                 // todo 维护manifest的metadata减少这一步
@@ -419,7 +423,7 @@ impl LsmStorageInner {
             compaction_controller,
             manifest,
             options: options.into(),
-            mvcc: Some(LsmMvccInner::new(0)),
+            mvcc: Some(LsmMvccInner::new(init_ts)),
             compaction_filters: Arc::new(Mutex::new(Vec::new())),
         };
 
@@ -436,9 +440,9 @@ impl LsmStorageInner {
     }
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
-    pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        let ts = self.mvcc().latest_commit_ts();
-        self.get_with_ts(_key, ts)
+    pub fn get(self: &Arc<Self>, _key: &[u8]) -> Result<Option<Bytes>> {
+        let txn = self.new_txn()?;
+        txn.get(_key)
     }
     pub fn get_with_ts(&self, _key: &[u8], read_ts: u64) -> Result<Option<Bytes>> {
         let key = KeySlice::from_slice(_key, read_ts);
@@ -522,7 +526,7 @@ impl LsmStorageInner {
                         .sstables
                         .get(&snapshot.levels[level].1[idx])
                         .unwrap();
-                    assert!(front.last_key() <= cur.first_key())
+                    assert!(front.last_key() <= cur.first_key());
                 }
             }
         }
@@ -584,7 +588,7 @@ impl LsmStorageInner {
 
     pub fn check_over_capacity(&self, _key: &[u8], _value: &[u8]) -> bool {
         let size = self.state.read().memtable.approximate_size();
-        size + _key.len() + _value.len() > self.options.target_sst_size
+        size + _key.len() + size_of::<u64>() + _value.len() > self.options.target_sst_size
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
@@ -711,9 +715,9 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    pub fn new_txn(&self) -> Result<()> {
+    pub fn new_txn(self: &Arc<Self>) -> Result<Arc<Transaction>> {
         // no-op
-        Ok(())
+        Ok(self.mvcc().new_txn(self.clone(), self.options.serializable))
     }
 
     fn overlap_range(
@@ -753,12 +757,12 @@ impl LsmStorageInner {
 
     /// Create an iterator over a range of keys.
     pub fn scan(
-        &self,
+        self: &Arc<Self>,
         _lower: Bound<&[u8]>,
         _upper: Bound<&[u8]>,
-    ) -> Result<FusedIterator<LsmIterator>> {
-        let ts = self.mvcc().latest_commit_ts();
-        self.scan_with_ts(_lower, _upper, ts)
+    ) -> Result<TxnIterator> {
+        let txn = self.new_txn()?;
+        txn.scan(_lower, _upper)
     }
     pub fn scan_with_ts(
         &self,
@@ -787,13 +791,10 @@ impl LsmStorageInner {
         // todo solve memtable exclude
         // test week1day6 感觉memtable是需要做lower处理的。
         let mut mem_merge_iter = MergeIterator::create(memtable_iters);
-        match _lower {
-            Bound::Excluded(x) => {
-                while mem_merge_iter.is_valid() && mem_merge_iter.key().key_ref() == x {
-                    mem_merge_iter.next()?
-                }
+        if let Bound::Excluded(x) = _lower {
+            while mem_merge_iter.is_valid() && mem_merge_iter.key().key_ref() == x {
+                mem_merge_iter.next()?
             }
-            _ => {}
         }
         // l0-sst
         let mut l0_sst_iters = Vec::with_capacity(snapshot.l0_sstables.len());

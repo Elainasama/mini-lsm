@@ -28,21 +28,43 @@ pub struct Transaction {
     pub(crate) key_hashes: Option<Mutex<(HashSet<u32>, HashSet<u32>)>>,
 }
 
+/// Create a bound of `Bytes` from a bound of `&[u8]`.
+pub(crate) fn map_bound(bound: Bound<&[u8]>) -> Bound<Bytes> {
+    match bound {
+        Bound::Included(x) => Bound::Included(Bytes::copy_from_slice(x)),
+        Bound::Excluded(x) => Bound::Excluded(Bytes::copy_from_slice(x)),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
 impl Transaction {
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+        if let Some(x) = self.local_storage.get(key) {
+            if x.value().is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(Bytes::copy_from_slice(x.value())));
+        }
+        self.inner.get_with_ts(key, self.read_ts)
     }
 
     pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
-        unimplemented!()
+        let old_iter = self.inner.scan_with_ts(lower, upper, self.read_ts)?;
+        let new_iter = TxnLocalIterator::new(
+            self.local_storage.clone(),
+            |map| map.range((map_bound(lower), map_bound(upper))),
+            (Bytes::new(), Bytes::new()),
+        );
+        TxnIterator::create(self.clone(), TwoMergeIterator::create(new_iter, old_iter)?)
     }
 
     pub fn put(&self, key: &[u8], value: &[u8]) {
-        unimplemented!()
+        self.local_storage
+            .insert(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value));
     }
 
     pub fn delete(&self, key: &[u8]) {
-        unimplemented!()
+        self.put(key, &[])
     }
 
     pub fn commit(&self) -> Result<()> {
@@ -73,19 +95,29 @@ impl StorageIterator for TxnLocalIterator {
     type KeyType<'a> = &'a [u8];
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.with_item(|item| &item.1)
     }
 
     fn key(&self) -> &[u8] {
-        unimplemented!()
+        self.with_item(|item| &item.0)
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.with_item(|item| !item.0.is_empty())
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        let nxt_item = {
+            self.with_iter_mut(|iter| {
+                if let Some(entry) = iter.next() {
+                    (entry.key().clone(), entry.value().clone())
+                } else {
+                    (Bytes::new(), Bytes::from_static(&[]))
+                }
+            })
+        };
+        self.with_item_mut(|item| *item = nxt_item);
+        Ok(())
     }
 }
 
@@ -99,7 +131,10 @@ impl TxnIterator {
         txn: Arc<Transaction>,
         iter: TwoMergeIterator<TxnLocalIterator, FusedIterator<LsmIterator>>,
     ) -> Result<Self> {
-        unimplemented!()
+        Ok(Self {
+            _txn: txn.clone(),
+            iter,
+        })
     }
 }
 
@@ -119,7 +154,7 @@ impl StorageIterator for TxnIterator {
     }
 
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        self.iter.next()
     }
 
     fn num_active_iterators(&self) -> usize {

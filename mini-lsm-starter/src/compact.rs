@@ -124,26 +124,24 @@ impl LsmStorageInner {
         while iter.is_valid() {
             // 只有最后一层可以删除delete墓碑。
             // todo 暂时删去删除墓碑的逻辑
-            if !is_bottom || !iter.value().is_empty() || true {
-                let key = iter.key();
-                let value = iter.value();
-                if builder.estimated_size() > self.options.target_sst_size
-                    && key.key_ref() != pre_key.key_ref()
-                {
-                    let old_builder = std::mem::replace(
-                        &mut builder,
-                        SsTableBuilder::new(self.options.block_size),
-                    );
-                    let id = self.next_sst_id();
-                    new_sst.push(Arc::new(old_builder.build(
-                        id,
-                        Some(self.block_cache.clone()),
-                        self.path_of_sst(id),
-                    )?));
-                }
-                builder.add(key, value);
-                pre_key = key.to_key_vec();
+            // !is_bottom || !iter.value().is_empty()
+            let key = iter.key();
+            let value = iter.value();
+            assert!(key >= pre_key.as_key_slice());
+            if builder.estimated_size() > self.options.target_sst_size
+                && key.key_ref() != pre_key.key_ref()
+            {
+                let old_builder =
+                    std::mem::replace(&mut builder, SsTableBuilder::new(self.options.block_size));
+                let id = self.next_sst_id();
+                new_sst.push(Arc::new(old_builder.build(
+                    id,
+                    Some(self.block_cache.clone()),
+                    self.path_of_sst(id),
+                )?));
             }
+            builder.add(key, value);
+            pre_key = key.to_key_vec();
             iter.next()?
         }
         // 最后一块sst
