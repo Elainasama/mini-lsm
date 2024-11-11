@@ -1,22 +1,22 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use std::{
-    collections::HashSet,
-    ops::Bound,
-    sync::{atomic::AtomicBool, Arc},
+use crate::lsm_storage::WriteBatchRecord;
+use crate::{
+    iterators::{two_merge_iterator::TwoMergeIterator, StorageIterator},
+    lsm_iterator::{FusedIterator, LsmIterator},
+    lsm_storage::LsmStorageInner,
 };
-
 use anyhow::Result;
 use bytes::Bytes;
 use crossbeam_skiplist::SkipMap;
 use ouroboros::self_referencing;
 use parking_lot::Mutex;
-
-use crate::{
-    iterators::{two_merge_iterator::TwoMergeIterator, StorageIterator},
-    lsm_iterator::{FusedIterator, LsmIterator},
-    lsm_storage::LsmStorageInner,
+use std::sync::atomic::Ordering;
+use std::{
+    collections::HashSet,
+    ops::Bound,
+    sync::{atomic::AtomicBool, Arc},
 };
 
 pub struct Transaction {
@@ -50,11 +50,12 @@ impl Transaction {
 
     pub fn scan(self: &Arc<Self>, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<TxnIterator> {
         let old_iter = self.inner.scan_with_ts(lower, upper, self.read_ts)?;
-        let new_iter = TxnLocalIterator::new(
+        let mut new_iter = TxnLocalIterator::new(
             self.local_storage.clone(),
             |map| map.range((map_bound(lower), map_bound(upper))),
             (Bytes::new(), Bytes::new()),
         );
+        new_iter.next()?;
         TxnIterator::create(self.clone(), TwoMergeIterator::create(new_iter, old_iter)?)
     }
 
@@ -68,7 +69,22 @@ impl Transaction {
     }
 
     pub fn commit(&self) -> Result<()> {
-        unimplemented!()
+        self.committed.store(true, Ordering::SeqCst);
+        let mut batch = vec![];
+        for entry in self
+            .local_storage
+            .range((map_bound(Bound::Unbounded), map_bound(Bound::Unbounded)))
+        {
+            batch.push(WriteBatchRecord::Put(
+                entry.key().clone(),
+                entry.value().clone(),
+            ));
+        }
+        self.inner
+            .write_batch_inner(&batch)
+            .expect("Txn Commit Fail");
+
+        Ok(())
     }
 }
 
@@ -138,6 +154,13 @@ impl TxnIterator {
             iter,
         })
     }
+
+    fn move_to_non_delete(&mut self) -> Result<()> {
+        while self.iter.is_valid() && self.iter.value().is_empty() {
+            self.iter.next()?;
+        }
+        Ok(())
+    }
 }
 
 impl StorageIterator for TxnIterator {
@@ -156,7 +179,8 @@ impl StorageIterator for TxnIterator {
     }
 
     fn next(&mut self) -> Result<()> {
-        self.iter.next()
+        self.iter.next()?;
+        self.move_to_non_delete()
     }
 
     fn num_active_iterators(&self) -> usize {

@@ -123,7 +123,6 @@ impl LsmStorageInner {
         let mut pre_key = KeyVec::new();
         while iter.is_valid() {
             // 只有最后一层可以删除delete墓碑。
-            // todo 暂时删去删除墓碑的逻辑
             let watermark = self.mvcc().watermark();
             let key = iter.key();
             let value = iter.value();

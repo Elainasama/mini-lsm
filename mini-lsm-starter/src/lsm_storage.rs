@@ -568,8 +568,10 @@ impl LsmStorageInner {
         Ok(None)
     }
 
-    /// Write a batch of data into the storage. Implement in week 2 day 7.
-    pub fn write_batch<T: AsRef<[u8]>>(&self, _batch: &[WriteBatchRecord<T>]) -> Result<()> {
+    pub fn write_batch_inner<T: AsRef<[u8]>>(
+        self: &Arc<Self>,
+        _batch: &[WriteBatchRecord<T>],
+    ) -> Result<()> {
         let _lock = self.mvcc().write_lock.lock();
         let ts = self.mvcc().latest_commit_ts() + 1;
         for record in _batch {
@@ -586,13 +588,37 @@ impl LsmStorageInner {
         Ok(())
     }
 
+    /// Write a batch of data into the storage. Implement in week 2 day 7.
+    pub fn write_batch<T: AsRef<[u8]>>(
+        self: &Arc<Self>,
+        _batch: &[WriteBatchRecord<T>],
+    ) -> Result<()> {
+        if !self.options.serializable {
+            self.write_batch_inner(_batch)?
+        } else {
+            let txn = self.mvcc().new_txn(self.clone(), self.options.serializable);
+            for record in _batch.iter() {
+                match record {
+                    WriteBatchRecord::Put(key, val) => {
+                        txn.put(key.as_ref(), val.as_ref());
+                    }
+                    WriteBatchRecord::Del(key) => {
+                        txn.delete(key.as_ref());
+                    }
+                }
+            }
+            txn.commit()?;
+        }
+        Ok(())
+    }
+
     pub fn check_over_capacity(&self, _key: &[u8], _value: &[u8]) -> bool {
         let size = self.state.read().memtable.approximate_size();
         size + _key.len() + size_of::<u64>() + _value.len() > self.options.target_sst_size
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
-    pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
+    pub fn put(self: &Arc<Self>, _key: &[u8], _value: &[u8]) -> Result<()> {
         self.write_batch(&[WriteBatchRecord::Put(_key, _value)])
     }
     pub fn put_with_ts(&self, _key: &[u8], _value: &[u8], ts: u64) -> Result<()> {
@@ -611,7 +637,7 @@ impl LsmStorageInner {
     }
 
     /// Remove a key from the storage by writing an empty value.
-    pub fn delete(&self, _key: &[u8]) -> Result<()> {
+    pub fn delete(self: &Arc<Self>, _key: &[u8]) -> Result<()> {
         self.write_batch(&[WriteBatchRecord::Del(_key)])
     }
 

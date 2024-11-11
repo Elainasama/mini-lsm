@@ -17,7 +17,7 @@ fn test_task3_compaction_integration() {
     let _txn = storage.new_txn().unwrap();
     let start = Instant::now();
     // todo update to 20000
-    for i in 0..=2000 {
+    for i in 0..=20000 {
         storage
             .put(b"0", format!("{:02000}", i).as_bytes())
             .unwrap();
