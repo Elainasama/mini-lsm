@@ -571,7 +571,7 @@ impl LsmStorageInner {
     pub fn write_batch_inner<T: AsRef<[u8]>>(
         self: &Arc<Self>,
         _batch: &[WriteBatchRecord<T>],
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let _lock = self.mvcc().write_lock.lock();
         let ts = self.mvcc().latest_commit_ts() + 1;
         for record in _batch {
@@ -585,7 +585,7 @@ impl LsmStorageInner {
             }
         }
         self.mvcc().update_commit_ts(ts);
-        Ok(())
+        Ok(ts)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -594,7 +594,7 @@ impl LsmStorageInner {
         _batch: &[WriteBatchRecord<T>],
     ) -> Result<()> {
         if !self.options.serializable {
-            self.write_batch_inner(_batch)?
+            self.write_batch_inner(_batch)?;
         } else {
             let txn = self.mvcc().new_txn(self.clone(), self.options.serializable);
             for record in _batch.iter() {
@@ -682,6 +682,7 @@ impl LsmStorageInner {
             let mut state = state_lock.as_ref().clone();
 
             let old_table = std::mem::replace(&mut state.memtable, new_table);
+            old_table.sync_wal()?;
             state.imm_memtables.insert(0, old_table);
             // wal and manifest
             if self.options.enable_wal {
