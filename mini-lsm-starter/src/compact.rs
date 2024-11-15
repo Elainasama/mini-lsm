@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use crate::iterators::merge_iterator::MergeIterator;
 use crate::iterators::StorageIterator;
-use crate::key::KeyVec;
+use crate::key::{KeySlice, KeyVec};
+use crate::lsm_storage::CompactionFilter::Prefix;
 use crate::lsm_storage::{LsmStorageInner, LsmStorageState};
 use crate::manifest::ManifestRecord;
 use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
@@ -111,6 +112,19 @@ pub enum CompactionOptions {
 }
 
 impl LsmStorageInner {
+    fn is_remove_by_filter(&self, key: &KeySlice) -> bool {
+        let guard = self.compaction_filters.lock();
+        for filter in &*guard {
+            match filter {
+                Prefix(x) => {
+                    if key.key_ref().starts_with(x) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
     fn create_new_sst(&self, sst: Vec<Arc<SsTable>>, is_bottom: bool) -> Result<Vec<Arc<SsTable>>> {
         let mut sst_iters = Vec::with_capacity(sst.len());
         for table in sst {
@@ -127,7 +141,7 @@ impl LsmStorageInner {
             let key = iter.key();
             let value = iter.value();
             assert!(key >= pre_key.as_key_slice());
-            if !is_bottom || key.ts() > watermark || !value.is_empty() {
+            if !is_bottom || key.ts() > watermark || (!value.is_empty() && !self.is_remove_by_filter(&key)) {
                 if builder.estimated_size() > self.options.target_sst_size
                     && key.key_ref() != pre_key.key_ref()
                 {
