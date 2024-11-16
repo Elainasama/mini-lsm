@@ -1,6 +1,3 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 mod builder;
 mod iterator;
 
@@ -14,8 +11,8 @@ pub struct Block {
     pub(crate) offsets: Vec<u16>,
 }
 
-const SIZE_U16: usize = std::mem::size_of::<u16>();
-const SIZE_U64: usize = std::mem::size_of::<u64>();
+const SIZE_U16: usize = size_of::<u16>();
+const SIZE_U64: usize = size_of::<u64>();
 impl Block {
     /// Encode the internal data to the data layout illustrated in the tutorial
     /// Note: You may want to recheck if any of the expected field is missing from your output

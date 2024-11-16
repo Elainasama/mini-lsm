@@ -29,7 +29,7 @@ impl<T: AsRef<[u8]>> Key<T> {
     }
 
     pub fn raw_len(&self) -> usize {
-        self.0.as_ref().len() + std::mem::size_of::<u64>()
+        self.0.as_ref().len() + size_of::<u64>()
     }
 
     pub fn is_empty(&self) -> bool {

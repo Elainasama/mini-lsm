@@ -141,7 +141,9 @@ impl LsmStorageInner {
             let key = iter.key();
             let value = iter.value();
             assert!(key >= pre_key.as_key_slice());
-            if !is_bottom || key.ts() > watermark || (!value.is_empty() && !self.is_remove_by_filter(&key)) {
+            if key.ts() > watermark
+                || ((!is_bottom || !value.is_empty()) && !self.is_remove_by_filter(&key))
+            {
                 if builder.estimated_size() > self.options.target_sst_size
                     && key.key_ref() != pre_key.key_ref()
                 {

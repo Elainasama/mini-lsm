@@ -1,6 +1,3 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 pub(crate) mod bloom;
 mod builder;
 mod iterator;
@@ -29,9 +26,9 @@ pub struct BlockMeta {
     /// The last key of the data block.
     pub last_key: KeyBytes,
 }
-const SIZE_U64: usize = std::mem::size_of::<u64>();
-const SIZE_U32: usize = std::mem::size_of::<u32>();
-const SIZE_U16: usize = std::mem::size_of::<u16>();
+const SIZE_U64: usize = size_of::<u64>();
+const SIZE_U32: usize = size_of::<u32>();
+const SIZE_U16: usize = size_of::<u16>();
 
 impl BlockMeta {
     /// Encode block meta to a buffer.

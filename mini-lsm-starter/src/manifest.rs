@@ -22,7 +22,7 @@ pub enum ManifestRecord {
     NewMemtable(usize),
     Compaction(CompactionTask, Vec<usize>),
 }
-const SIZE_U32: usize = std::mem::size_of::<u32>();
+const SIZE_U32: usize = size_of::<u32>();
 impl Manifest {
     pub fn create(_path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {

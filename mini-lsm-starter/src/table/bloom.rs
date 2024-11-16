@@ -43,7 +43,7 @@ impl<T: AsMut<[u8]>> BitSliceMut for T {
         }
     }
 }
-const SIZE_U32: usize = std::mem::size_of::<u32>();
+const SIZE_U32: usize = size_of::<u32>();
 impl Bloom {
     /// Decode a bloom filter
     pub fn decode(buf: &[u8]) -> Result<Self> {
@@ -89,7 +89,6 @@ impl Bloom {
         let mut filter = BytesMut::with_capacity(nbytes);
         filter.resize(nbytes, 0);
 
-        // TODO: build the bloom filter
         for hash in keys {
             let mut h = *hash;
             let delta = (h >> 17) | (h << 15);
@@ -114,10 +113,9 @@ impl Bloom {
             let nbits = self.filter.bit_len();
             let delta = (h >> 17) | (h << 15);
 
-            // TODO: probe the bloom filter
             let mut h = h;
             for _ in 0..self.k {
-                if !self.filter.get_bit(h as usize % self.filter.bit_len()) {
+                if !self.filter.get_bit(h as usize % nbits) {
                     return false;
                 }
                 h = h.wrapping_add(delta);

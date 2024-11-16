@@ -1,6 +1,3 @@
-#![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
-#![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
-
 use super::{Block, SIZE_U64};
 use crate::key::{Key, KeySlice, KeyVec};
 use bytes::Buf;
@@ -20,7 +17,7 @@ pub struct BlockIterator {
     first_key: KeyVec,
 }
 
-const SIZE_U16: usize = std::mem::size_of::<u16>();
+const SIZE_U16: usize = size_of::<u16>();
 impl BlockIterator {
     fn new(block: Arc<Block>) -> Self {
         Self {

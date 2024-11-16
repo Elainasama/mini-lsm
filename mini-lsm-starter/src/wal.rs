@@ -15,10 +15,10 @@ pub struct Wal {
     file: Arc<Mutex<BufWriter<File>>>,
 }
 
-const SIZE_U16: usize = std::mem::size_of::<u16>();
-const SIZE_U32: usize = std::mem::size_of::<u32>();
+const SIZE_U16: usize = size_of::<u16>();
+const SIZE_U32: usize = size_of::<u32>();
 
-const SIZE_U64: usize = std::mem::size_of::<u64>();
+const SIZE_U64: usize = size_of::<u64>();
 impl Wal {
     pub fn create(_path: impl AsRef<Path>) -> Result<Self> {
         let file = File::create(_path)?;
