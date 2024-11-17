@@ -574,16 +574,19 @@ impl LsmStorageInner {
     ) -> Result<u64> {
         let _lock = self.mvcc().write_lock.lock();
         let ts = self.mvcc().latest_commit_ts() + 1;
+        let mut data = Vec::with_capacity(_batch.len());
         for record in _batch {
             match record {
                 WriteBatchRecord::Put(key, val) => {
-                    self.put_with_ts(key.as_ref(), val.as_ref(), ts)?;
+                    data.push((KeySlice::from_slice(key.as_ref(), ts), val.as_ref()));
                 }
                 WriteBatchRecord::Del(key) => {
-                    self.delete_with_ts(key.as_ref(), ts)?;
+                    data.push((KeySlice::from_slice(key.as_ref(), ts), &[]));
                 }
             }
         }
+        // 尝试把txn的操作全部归到一起
+        self.put_batch(&data)?;
         self.mvcc().update_commit_ts(ts);
         Ok(ts)
     }
@@ -612,37 +615,34 @@ impl LsmStorageInner {
         Ok(())
     }
 
-    pub fn check_over_capacity(&self, _key: &[u8], _value: &[u8]) -> bool {
+    pub fn check_over_capacity(&self, _data: &[(KeySlice, &[u8])]) -> bool {
         let size = self.state.read().memtable.approximate_size();
-        size + _key.len() + size_of::<u64>() + _value.len() > self.options.target_sst_size
+        let mut add_size = 0;
+        for (k, v) in _data.iter() {
+            add_size += k.raw_len() + v.len();
+        }
+        size + add_size > self.options.target_sst_size
     }
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(self: &Arc<Self>, _key: &[u8], _value: &[u8]) -> Result<()> {
         self.write_batch(&[WriteBatchRecord::Put(_key, _value)])
     }
-    pub fn put_with_ts(&self, _key: &[u8], _value: &[u8], ts: u64) -> Result<()> {
+    pub fn put_batch(&self, _data: &[(KeySlice, &[u8])]) -> Result<()> {
         // 超过memtable的容量
-        if self.check_over_capacity(_key, _value) {
+        if self.check_over_capacity(_data) {
             let state_lock = self.state_lock.lock();
-            if self.check_over_capacity(_key, _value) {
+            if self.check_over_capacity(_data) {
                 self.force_freeze_memtable(&state_lock)?;
             }
         }
         // 可以支持不可变引用更新
-        self.state
-            .read()
-            .memtable
-            .put(KeySlice::from_slice(_key, ts), _value)
+        self.state.read().memtable.put_batch(_data)
     }
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(self: &Arc<Self>, _key: &[u8]) -> Result<()> {
         self.write_batch(&[WriteBatchRecord::Del(_key)])
-    }
-
-    pub fn delete_with_ts(&self, _key: &[u8], ts: u64) -> Result<()> {
-        self.put_with_ts(_key, &[], ts)
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
